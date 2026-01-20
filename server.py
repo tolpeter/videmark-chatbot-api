@@ -1,6 +1,7 @@
 import os
 import time
 import json
+import re  # Szövegtisztításhoz
 import smtplib
 from email.mime.text import MIMEText
 from typing import Optional, Dict, Any, List
@@ -13,12 +14,11 @@ from openai import OpenAI
 # ---------------- CONFIG ----------------
 # API Kulcsok
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-# Helyes modell név: gpt-4o-mini vagy gpt-4o
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
 
-# Vector Store ID (a WP plugin vagy /admin/create_vector_store adja)
+# Vector Store ID (Adatok helye)
 OPENAI_VECTOR_STORE_ID = os.getenv("OPENAI_VECTOR_STORE_ID", "").strip()
-# Assistant ID (Ha már van, beállíthatod, ha nincs, a kód létrehoz egyet és kiírja)
+# Assistant ID (Automatikus generáljuk, ha nincs)
 OPENAI_ASSISTANT_ID = os.getenv("OPENAI_ASSISTANT_ID", "").strip()
 
 # Titkosítók
@@ -30,7 +30,7 @@ SMTP_SERVER = os.getenv("SMTP_SERVER", "smtp.gmail.com")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
 SMTP_USER = os.getenv("SMTP_USER", "")
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
-NOTIFY_EMAIL = os.getenv("NOTIFY_EMAIL", "info@videmark.hu") # Ide küldi a leadet
+NOTIFY_EMAIL = os.getenv("NOTIFY_EMAIL", "info@videmark.hu")
 
 ALLOWED_ORIGINS = [
     o.strip() for o in os.getenv("ALLOWED_ORIGINS", "https://videmark.hu,https://www.videmark.hu").split(",") if o.strip()
@@ -47,17 +47,16 @@ Feladatod:
 2. LEAD GYŰJTÉS: Ha az ügyfél érdeklődik, kérd el ezeket: Név, Email, Telefonszám, Projekt leírása.
 3. HA megkaptad az adatokat, hívd meg a 'save_lead' funkciót!
 
-Stílus: Magyar, tegező, segítőkész, rövid (max 3 mondat).
+Stílus: Magyar, tegező, segítőkész, rövid (max 3 mondat). Formázd a választ félkövér szöveggel a fontos részeknél.
 """.strip()
 
 # Globális kliens
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 # Memória cache: Session ID -> Thread ID párosítás
-# (Újraindításkor elveszik, élesben érdemes Redis-t vagy adatbázist használni, de kezdetnek jó)
 _thread_map: Dict[str, str] = {}
 
-app = FastAPI(title="Videmark Chatbot API v2")
+app = FastAPI(title="Videmark Chatbot API v2.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -70,7 +69,7 @@ app.add_middleware(
 # ---------------- MODELLEK ----------------
 class ChatReq(BaseModel):
     message: str
-    session_id: str # Mostantól kötelező, hogy tudjuk követni a szálat
+    session_id: str
     chatbot_secret: Optional[str] = None
 
 class ChatResp(BaseModel):
@@ -112,24 +111,23 @@ def send_email_notification(lead_data: dict):
         print(f"❌ Email hiba: {e}")
 
 def get_or_create_assistant():
-    """Létrehozza vagy frissíti az Assistant-t a Vector Store-ral."""
+    """Létrehozza vagy frissíti az Assistant-t."""
     global OPENAI_ASSISTANT_ID
     
-    # Eszközök definíciója (File Search + Lead Mentés)
     tools = [
         {"type": "file_search"},
         {
             "type": "function",
             "function": {
                 "name": "save_lead",
-                "description": "Mentse el az érdeklődő adatait, ha megadta a nevét és elérhetőségét.",
+                "description": "Mentse el az érdeklődő adatait.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "name": {"type": "string", "description": "Az ügyfél neve"},
-                        "email": {"type": "string", "description": "Az ügyfél email címe"},
-                        "phone": {"type": "string", "description": "Az ügyfél telefonszáma"},
-                        "description": {"type": "string", "description": "Mit szeretne (pl. drón videó)"}
+                        "name": {"type": "string"},
+                        "email": {"type": "string"},
+                        "phone": {"type": "string"},
+                        "description": {"type": "string"}
                     },
                     "required": ["name", "email"]
                 }
@@ -137,13 +135,8 @@ def get_or_create_assistant():
         }
     ]
 
-    # Ha már van ID-nk ENV-ben, használjuk azt, de frissíthetjük is
     if OPENAI_ASSISTANT_ID:
-        try:
-            # Opcionális: itt lehetne update-elni az assistant-t, ha változott a prompt
-            return OPENAI_ASSISTANT_ID
-        except:
-            pass
+        return OPENAI_ASSISTANT_ID
     
     tool_resources = {}
     if OPENAI_VECTOR_STORE_ID:
@@ -158,7 +151,7 @@ def get_or_create_assistant():
         tool_resources=tool_resources
     )
     OPENAI_ASSISTANT_ID = assistant.id
-    print(f"✅ Assistant létrehozva: {OPENAI_ASSISTANT_ID} (Másold be ezt a Render ENV-be!)")
+    print(f"✅ Assistant létrehozva: {OPENAI_ASSISTANT_ID}")
     return OPENAI_ASSISTANT_ID
 
 # ---------------- ENDPOINTS ----------------
@@ -166,7 +159,7 @@ def get_or_create_assistant():
 @app.get("/")
 def root():
     return {
-        "service": "Videmark Chatbot V2",
+        "service": "Videmark Chatbot V2.1",
         "model": OPENAI_MODEL,
         "assistant_id": OPENAI_ASSISTANT_ID,
         "vector_store": OPENAI_VECTOR_STORE_ID
@@ -174,120 +167,95 @@ def root():
 
 @app.post("/chat", response_model=ChatResp)
 def chat(req: ChatReq, x_chatbot_secret: str = Header(default="")):
-    # 1. Auth ellenőrzés
     token = req.chatbot_secret or x_chatbot_secret
     if CHATBOT_SECRET and token != CHATBOT_SECRET:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     assistant_id = get_or_create_assistant()
     
-    # 2. Thread kezelés (Session alapján)
     thread_id = _thread_map.get(req.session_id)
     if not thread_id:
-        # Új szál indítása
         thread = client.beta.threads.create()
         thread_id = thread.id
         _thread_map[req.session_id] = thread_id
     
-    # 3. Üzenet hozzáadása
     client.beta.threads.messages.create(
         thread_id=thread_id,
         role="user",
         content=req.message
     )
 
-    # 4. Futtatás (Run)
     run = client.beta.threads.runs.create(
         thread_id=thread_id,
         assistant_id=assistant_id
     )
 
-    # 5. Várakozás a válaszra (Polling)
-    # Az Assistants API aszinkron, várni kell, míg befejezi a gondolkodást
     while True:
         run_status = client.beta.threads.runs.retrieve(thread_id=thread_id, run_id=run.id)
         
         if run_status.status == 'completed':
             break
         elif run_status.status == 'requires_action':
-            # FUNCTION CALLING (Lead mentés)
             tool_outputs = []
             for tool_call in run_status.required_action.submit_tool_outputs.tool_calls:
                 if tool_call.function.name == "save_lead":
-                    # Adatok kinyerése
                     args = json.loads(tool_call.function.arguments)
-                    send_email_notification(args) # Email küldése
-                    
+                    send_email_notification(args)
                     tool_outputs.append({
                         "tool_call_id": tool_call.id,
-                        "output": '{"success": true, "message": "Lead saved successfully."}'
+                        "output": '{"success": true, "message": "Lead saved via email."}'
                     })
-            
-            # Visszaküldjük az eredményt az AI-nak
             if tool_outputs:
                 client.beta.threads.runs.submit_tool_outputs(
-                    thread_id=thread_id,
-                    run_id=run.id,
-                    tool_outputs=tool_outputs
+                    thread_id=thread_id, run_id=run.id, tool_outputs=tool_outputs
                 )
-            # Folytatódik a ciklus (várjuk a szöveges választ)
             continue
-            
         elif run_status.status in ['failed', 'cancelled', 'expired']:
-            return ChatResp(reply="Sajnos hiba történt a feldolgozás során.")
+            return ChatResp(reply="Sajnos technikai hiba történt. Próbáld újra később.")
         
         time.sleep(0.5)
 
-    # 6. Válasz kinyerése
+    # VÁLASZ TISZTÍTÁSA ÉS KINYERÉSE
     messages = client.beta.threads.messages.list(thread_id=thread_id)
-    # Az utolsó üzenet az assistant-tól (messages[0] a legfrissebb)
     last_msg = messages.data[0]
     
-    reply_text = "Nem kaptam választ."
+    reply_text = "..."
     if last_msg.role == "assistant":
-        # Összefűzzük a szöveges részeket (kivéve a hivatkozásokat)
         parts = []
         for content in last_msg.content:
             if content.type == 'text':
-                parts.append(content.text.value)
+                val = content.text.value
+                # REGEX: Annotációk törlése
+                val = re.sub(r'【.*?】', '', val)
+                parts.append(val)
         reply_text = "\n".join(parts)
 
     return ChatResp(reply=reply_text)
 
-
-# --- ADMIN RÉSZEK (Maradhatnak a régiek, kicsit egyszerűsítve) ---
+# --- ADMIN FELTÖLTÉS (Javítva az új klienshez) ---
 @app.post("/admin/upload")
 def admin_upload(file: UploadFile = File(...), x_admin_secret: str = Header(default="")):
     if ADMIN_SECRET and x_admin_secret != ADMIN_SECRET:
         raise HTTPException(401, "Admin secret needed")
-    
     if not OPENAI_VECTOR_STORE_ID:
-         raise HTTPException(400, "Nincs beállítva OPENAI_VECTOR_STORE_ID a környezeti változókban!")
+         raise HTTPException(400, "Nincs OPENAI_VECTOR_STORE_ID!")
 
-    # 1. Feltöltés OpenAI-hoz
     try:
         openai_file = client.files.create(
             file=(file.filename, file.file.read()),
             purpose="assistants"
         )
-    except Exception as e:
-        raise HTTPException(500, f"OpenAI upload hiba: {str(e)}")
-
-    # 2. Hozzáadás a Vector Store-hoz
-    try:
         client.beta.vector_stores.files.create(
             vector_store_id=OPENAI_VECTOR_STORE_ID,
             file_id=openai_file.id
         )
     except Exception as e:
-        raise HTTPException(500, f"Vector store attach hiba: {str(e)}")
+        raise HTTPException(500, f"Hiba: {str(e)}")
 
-    return {"status": "ok", "filename": file.filename, "file_id": openai_file.id}
+    return {"status": "ok", "filename": file.filename}
 
-# A /create_vector_store endpoint maradhat a régi logikával vagy használhatja a client-et
 @app.post("/admin/create_vector_store")
 def create_vs(name: str = "VidemarkStore", x_admin_secret: str = Header(default="")):
     if ADMIN_SECRET and x_admin_secret != ADMIN_SECRET: raise HTTPException(401)
-    
     vs = client.beta.vector_stores.create(name=name)
-    return {"id": vs.id, "note": "Add hozzá az ENV-hez: OPENAI_VECTOR_STORE_ID"}
+    return {"id": vs.id, "note": "Add Render ENV-hez: OPENAI_VECTOR_STORE_ID"}
