@@ -87,9 +87,9 @@ def call_openai(messages: List[Dict[str, str]]) -> str:
     url = "https://api.openai.com/v1/responses"
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
 
-    input_msgs = [{"role": "system", "content": [{"type": "text", "text": SYSTEM_PROMPT}]}]
-    for m in messages:
-        input_msgs.append({"role": m["role"], "content": [{"type": "text", "text": m["content"]}]})
+    input_msgs = [{"role": "system", "content": [{"type": "input_text", "text": SYSTEM_PROMPT}]}]
+for m in messages:
+    input_msgs.append({"role": m["role"], "content": [{"type": "input_text", "text": m["content"]}]})
 
     payload = {"model": OPENAI_MODEL, "input": input_msgs, "temperature": 0.4, "max_output_tokens": 500}
 
