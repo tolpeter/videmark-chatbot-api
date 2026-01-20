@@ -3,7 +3,6 @@ import time
 import json
 import re
 import smtplib
-import markdown  # <--- EZ AZ ÚJ VARÁZSLAT
 from email.mime.text import MIMEText
 from typing import Optional, Dict, Any, List
 
@@ -20,7 +19,7 @@ OPENAI_ASSISTANT_ID = os.getenv("OPENAI_ASSISTANT_ID", "").strip()
 CHATBOT_SECRET = os.getenv("CHATBOT_SECRET", "").strip()
 ADMIN_SECRET = os.getenv("ADMIN_SECRET", "").strip()
 
-# Email config
+# Email beállítások
 SMTP_SERVER = os.getenv("SMTP_SERVER", "smtp.gmail.com")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
 SMTP_USER = os.getenv("SMTP_USER", "")
@@ -31,22 +30,36 @@ ALLOWED_ORIGINS = [
     o.strip() for o in os.getenv("ALLOWED_ORIGINS", "https://videmark.hu,https://www.videmark.hu").split(",") if o.strip()
 ]
 
+# --- ITT TANÍTJUK AZ AI-T (PROMPT) ---
 SYSTEM_PROMPT = """
-Te a Videmark weboldal hivatalos, barátságos asszisztense vagy.
-Szolgáltatások: Drón videó/fotó, reklámvideó, short tartalom (TikTok/Reels), fotózás.
+Te a Videmark weboldal profi értékesítő asszisztense vagy.
 
-Feladatod:
-1. Válaszolj kérdésekre a tudásbázis alapján.
-2. Formázás: Használj Markdown formázást! (### Címsor, **Félkövér**, - Lista elem).
-3. LEAD GYŰJTÉS: Ha az ügyfél érdeklődik, kérd el: Név, Email, Telefonszám, Leírás. Ha megvan, hívd a 'save_lead' funkciót.
+TUDÁSBÁZIS: Használd a feltöltött fájlokat a válaszadáshoz.
 
-Stílus: Magyar, tegező, segítőkész.
+FONTOS VISELKEDÉSI SZABÁLYOK:
+1. PONTOSÍTÁS (Nagyon fontos!):
+   - Ha a felhasználó csak annyit kérdez: "Mennyibe kerül egy videó?" vagy "Milyen árak vannak?", NE sorold fel azonnal az összes árat!
+   - Ehelyett kérdezz vissza: "Szívesen segítek! Milyen típusú videóra gondoltál? (pl. Drón felvétel, Reklámvideó, Rendezvény videózás vagy Social Média tartalom?)"
+   - Csak akkor mondj konkrét árat, ha tudod, mit akar.
+
+2. LEAD GYŰJTÉS:
+   - Ha az ügyfél konkrét árajánlatot kér vagy komolyan érdeklődik, kérd el az adatait: Név, Email, Telefonszám, Rövid leírás.
+   - Ha megkaptad, hívd meg a 'save_lead' funkciót.
+
+3. FORMÁZÁS (Hogy szép legyen):
+   - A fontos szavakat, árakat mindig emeld ki így: **ár**.
+   - Felsorolásnál használj kötőjelet:
+     - Tétel 1
+     - Tétel 2
+   - Használj címsorokat: ### Címsor
+
+Stílus: Magyar, közvetlen, segítőkész, rövid és lényegretörő.
 """.strip()
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 _thread_map: Dict[str, str] = {}
 
-app = FastAPI(title="Videmark Chatbot API v3.0 (HTML)")
+app = FastAPI(title="Videmark Chatbot API v4.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -64,7 +77,62 @@ class ChatReq(BaseModel):
 class ChatResp(BaseModel):
     reply: str
 
-# ---------------- SEGÉDFÜGGVÉNYEK ----------------
+# ---------------- SAJÁT HTML FORMÁZÓ (NEM KELL KÜLSŐ FÁJL) ----------------
+def format_to_html(text: str) -> str:
+    """Átalakítja a Markdown jeleket szép HTML kódra a szerveren."""
+    if not text: return ""
+
+    # 1. Hivatkozások tisztítása
+    text = re.sub(r'【.*?】', '', text)
+
+    # 2. Címsorok (### Cím) -> <h3>Cím</h3>
+    # A szöveg közepén lévő ###-ket is kezeli
+    lines = text.split('\n')
+    html_lines = []
+    
+    in_list = False
+
+    for line in lines:
+        line = line.strip()
+        if not line:
+            if in_list: 
+                html_lines.append("</ul>")
+                in_list = False
+            continue
+
+        # Lista kezelés (- elem)
+        if line.startswith("- ") or line.startswith("* "):
+            if not in_list:
+                html_lines.append('<ul style="margin: 5px 0 10px 20px; padding: 0;">')
+                in_list = True
+            content = line[2:]
+            # Félkövér a listán belül
+            content = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', content)
+            html_lines.append(f'<li style="margin-bottom: 5px; list-style: disc;">{content}</li>')
+        
+        # Címsor kezelés (###)
+        elif line.startswith("###"):
+            if in_list:
+                html_lines.append("</ul>")
+                in_list = False
+            content = line.replace("###", "").strip()
+            html_lines.append(f'<h3 style="margin: 15px 0 5px 0; font-size: 16px; border-bottom: 1px solid rgba(255,255,255,0.2);">{content}</h3>')
+        
+        # Sima szöveg
+        else:
+            if in_list:
+                html_lines.append("</ul>")
+                in_list = False
+            # Félkövér
+            line = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', line)
+            html_lines.append(f'<p style="margin: 0 0 8px 0;">{line}</p>')
+
+    if in_list:
+        html_lines.append("</ul>")
+
+    return "\n".join(html_lines)
+
+# ---------------- FUNKCIÓK ----------------
 
 def send_email_notification(lead_data: dict):
     if not SMTP_USER or not SMTP_PASSWORD:
@@ -100,8 +168,10 @@ def send_email_notification(lead_data: dict):
 
 def get_or_create_assistant():
     global OPENAI_ASSISTANT_ID
+    # Ha már van ID, használjuk (gyorsabb)
     if OPENAI_ASSISTANT_ID: return OPENAI_ASSISTANT_ID
     
+    # Eszközök
     tools = [
         {"type": "file_search"},
         {
@@ -127,8 +197,10 @@ def get_or_create_assistant():
     if OPENAI_VECTOR_STORE_ID:
         tool_resources = {"file_search": {"vector_store_ids": [OPENAI_VECTOR_STORE_ID]}}
 
+    # Assistant létrehozása (minden induláskor frissíti a promptot!)
+    # Megjegyzés: Élesben érdemes lehet update-elni a meglévőt, de így a legegyszerűbb, hogy érvényesüljön az új prompt.
     asst = client.beta.assistants.create(
-        name="Videmark Assistant",
+        name="Videmark Assistant V4",
         instructions=SYSTEM_PROMPT,
         model=OPENAI_MODEL,
         tools=tools,
@@ -141,7 +213,7 @@ def get_or_create_assistant():
 
 @app.get("/")
 def root():
-    return {"status": "ok", "mode": "HTML server-side rendering"}
+    return {"status": "ok", "mode": "HTML server-side rendering v4"}
 
 @app.post("/chat", response_model=ChatResp)
 def chat(req: ChatReq, x_chatbot_secret: str = Header(default="")):
@@ -173,11 +245,16 @@ def chat(req: ChatReq, x_chatbot_secret: str = Header(default="")):
             tool_outputs = []
             for tool_call in run_status.required_action.submit_tool_outputs.tool_calls:
                 if tool_call.function.name == "save_lead":
-                    args = json.loads(tool_call.function.arguments)
-                    send_email_notification(args)
+                    try:
+                        args = json.loads(tool_call.function.arguments)
+                        send_email_notification(args)
+                        output_str = '{"success": true, "message": "Email elküldve."}'
+                    except:
+                        output_str = '{"success": false}'
+                    
                     tool_outputs.append({
                         "tool_call_id": tool_call.id,
-                        "output": '{"success": true}'
+                        "output": output_str
                     })
             if tool_outputs:
                 client.beta.threads.runs.submit_tool_outputs(
@@ -188,26 +265,21 @@ def chat(req: ChatReq, x_chatbot_secret: str = Header(default="")):
             return ChatResp(reply="Hiba történt. Próbáld újra.")
         time.sleep(0.5)
 
-    # VÁLASZ TISZTÍTÁSA ÉS HTML KONVERTÁLÁS
+    # VÁLASZ LEKÉRÉSE ÉS FORMÁZÁSA
     messages = client.beta.threads.messages.list(thread_id=thread_id)
     last_msg = messages.data[0]
     
     reply_text = ""
     if last_msg.role == "assistant":
-        parts = []
+        raw_parts = []
         for content in last_msg.content:
             if content.type == 'text':
-                val = content.text.value
-                # 1. Annotációk törlése
-                val = re.sub(r'【.*?】', '', val)
-                parts.append(val)
+                raw_parts.append(content.text.value)
         
-        raw_text = "\n".join(parts)
+        raw_text = "\n".join(raw_parts)
         
-        # 2. ITT A LÉNYEG: Markdown -> HTML átalakítás a szerveren!
-        # Ez csinál a **-ból <b>-t, a listából <ul>-t.
-        html_reply = markdown.markdown(raw_text)
-        reply_text = html_reply
+        # ITT A LÉNYEG: A szerver alakítja át HTML-lé!
+        reply_text = format_to_html(raw_text)
 
     return ChatResp(reply=reply_text)
 
