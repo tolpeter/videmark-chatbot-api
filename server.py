@@ -64,7 +64,7 @@ Stílus: Magyar, közvetlen, segítőkész, rövid és lényegretörő.
 client = OpenAI(api_key=OPENAI_API_KEY)
 _thread_map: Dict[str, str] = {}
 
-app = FastAPI(title="Videmark Chatbot API v4.4 (KB + OCR + Admin files, robust list)")
+app = FastAPI(title="Videmark Chatbot API v4.5 (KB + OCR + Admin files fixed listing)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -97,24 +97,20 @@ def threads_api(_client: OpenAI):
 
 # ---------------- HELPERS ----------------
 def obj_to_dict(x: Any) -> dict:
-    """OpenAI SDK objektum -> dict (biztonságosan)."""
     if x is None:
         return {}
     if isinstance(x, dict):
         return x
-    # pydantic v2
     if hasattr(x, "model_dump"):
         try:
             return x.model_dump()
         except Exception:
             pass
-    # pydantic v1
     if hasattr(x, "dict"):
         try:
             return x.dict()
         except Exception:
             pass
-    # fallback
     try:
         return json.loads(json.dumps(x, default=lambda o: getattr(o, "__dict__", str(o))))
     except Exception:
@@ -125,6 +121,23 @@ def pick(d: dict, keys: List[str], default=None):
         if k in d and d[k] is not None:
             return d[k]
     return default
+
+def safe_get_file_meta(file_id: str) -> dict:
+    """
+    OpenAI Files meta lekérés: ha file_id tényleg OpenAI file id (pl. file-xxx),
+    akkor itt visszaadjuk a filename/created_at adatokat.
+    """
+    if not file_id:
+        return {"filename": "", "created_at": None}
+
+    try:
+        fmeta = client.files.retrieve(file_id)
+        return {
+            "filename": getattr(fmeta, "filename", "") or "",
+            "created_at": getattr(fmeta, "created_at", None),
+        }
+    except Exception:
+        return {"filename": "", "created_at": None}
 
 # ---------------- MODELS ----------------
 class ChatReq(BaseModel):
@@ -244,7 +257,7 @@ def get_or_create_assistant():
         tool_resources = {"file_search": {"vector_store_ids": [OPENAI_VECTOR_STORE_ID]}}
 
     asst = assistants_api(client).create(
-        name="Videmark Assistant V4.4",
+        name="Videmark Assistant V4.5",
         instructions=SYSTEM_PROMPT,
         model=OPENAI_MODEL,
         tools=tools,
@@ -303,7 +316,7 @@ def upload_text_as_file_to_vector_store(text: str, filename: str) -> dict:
     content = text.encode("utf-8", errors="ignore")
     f = client.files.create(file=(filename, content), purpose="assistants")
     vsf = vs_api(client).files.create(vector_store_id=OPENAI_VECTOR_STORE_ID, file_id=f.id)
-    return {"file_id": f.id, "vector_store_file_id": vsf.id, "filename": filename}
+    return {"file_id": f.id, "vector_store_file_id": getattr(vsf, "id", None), "filename": filename}
 
 # ---------------- ENDPOINTS ----------------
 @app.get("/")
@@ -404,13 +417,14 @@ def admin_upload(
                 results.append({"source": filename, "mode": "pdf_ocr", "uploaded": upload_text_as_file_to_vector_store(ocred, txt_name)})
             continue
 
+        # direct file
         f = client.files.create(file=(filename, raw), purpose="assistants")
         vsf = vs_api(client).files.create(vector_store_id=OPENAI_VECTOR_STORE_ID, file_id=f.id)
-        results.append({"source": filename, "mode": "direct", "file_id": f.id, "vector_store_file_id": vsf.id})
+        results.append({"source": filename, "mode": "direct", "file_id": f.id, "vector_store_file_id": getattr(vsf, "id", None)})
 
     return {"status": "ok", "results": results}
 
-# ---------------- ADMIN: FILES LIST ----------------
+# ---------------- ADMIN: FILES LIST (FIXED) ----------------
 @app.get("/admin/files")
 def admin_files(x_admin_secret: str = Header(default="")):
     require_admin(x_admin_secret)
@@ -420,46 +434,45 @@ def admin_files(x_admin_secret: str = Header(default="")):
 
     out = []
     for it in items.data:
-        # it.id = vector_store_file_id (pl. file-...)
-        vs_file_id = getattr(it, "id", None) or obj_to_dict(it).get("id")
+        d_it = obj_to_dict(it)
+        vs_file_id = getattr(it, "id", None) or d_it.get("id") or ""
 
-        # Itt jön a lényeg: részletek lekérése
+        status = getattr(it, "status", "") or d_it.get("status", "")
+
+        # 1) próbáljuk a details.retrieve-ből
         file_id = None
-        status = getattr(it, "status", "") or obj_to_dict(it).get("status", "")
-
         try:
-            details = vs_api(client).files.retrieve(
-                vector_store_id=OPENAI_VECTOR_STORE_ID,
-                file_id=vs_file_id
-            )
+            details = vs_api(client).files.retrieve(vector_store_id=OPENAI_VECTOR_STORE_ID, file_id=vs_file_id)
             dd = obj_to_dict(details)
 
-            # több lehetséges helyről próbáljuk kinyerni
-            file_id = dd.get("file_id") or dd.get("file", {}).get("id") or dd.get("file", {}).get("file_id")
+            # több lehetséges mező
+            file_id = (
+                dd.get("file_id")
+                or (dd.get("file") or {}).get("id")
+                or (dd.get("file") or {}).get("file_id")
+                or dd.get("openai_file_id")
+                or dd.get("source_file_id")
+            )
             status = dd.get("status") or status
-
         except Exception:
             dd = {}
 
-        fname = ""
-        created_at = None
-        if file_id:
-            try:
-                fmeta = client.files.retrieve(file_id)
-                fname = getattr(fmeta, "filename", "") or ""
-                created_at = getattr(fmeta, "created_at", None)
-            except Exception:
-                pass
+        # 2) ha továbbra sincs file_id, nálad a vs_file_id "file-..." → ez gyakran maga az OpenAI file id
+        if not file_id and isinstance(vs_file_id, str) and vs_file_id.startswith("file-"):
+            file_id = vs_file_id
+
+        meta = safe_get_file_meta(file_id) if file_id else {"filename": "", "created_at": None}
 
         out.append({
             "vector_store_file_id": vs_file_id,
             "file_id": file_id,
             "status": status,
-            "filename": fname,
-            "created_at": created_at
+            "filename": meta.get("filename", "") or "",
+            "created_at": meta.get("created_at", None),
         })
 
     return {"status": "ok", "files": out}
+
 # ---------------- ADMIN: DELETE ----------------
 @app.delete("/admin/files/{vector_store_file_id}")
 def admin_delete_file(
@@ -470,50 +483,50 @@ def admin_delete_file(
     require_admin(x_admin_secret)
     require_vs()
 
-    vs_item = None
+    # próbáljuk lekérni a részleteket, hogy meglegyen az underlying file_id is
+    underlying_file_id = None
     try:
         vs_item = vs_api(client).files.retrieve(vector_store_id=OPENAI_VECTOR_STORE_ID, file_id=vector_store_file_id)
+        dd = obj_to_dict(vs_item)
+        underlying_file_id = (
+            dd.get("file_id")
+            or (dd.get("file") or {}).get("id")
+            or (dd.get("file") or {}).get("file_id")
+            or dd.get("openai_file_id")
+            or dd.get("source_file_id")
+        )
     except Exception:
-        pass
+        underlying_file_id = None
 
+    # VS-ből törlés
     vs_api(client).files.delete(vector_store_id=OPENAI_VECTOR_STORE_ID, file_id=vector_store_file_id)
 
-    if delete_underlying_file and vs_item is not None:
-        d = obj_to_dict(vs_item)
-        file_id = pick(d, ["file_id"], None)
-        if not file_id:
-            file_obj = pick(d, ["file"], None)
-            if isinstance(file_obj, dict):
-                file_id = file_obj.get("id") or file_obj.get("file_id")
-            else:
-                try:
-                    file_id = getattr(file_obj, "id", None) or getattr(file_obj, "file_id", None)
-                except Exception:
-                    file_id = None
+    # opcionális: OpenAI Files-ból is töröljük
+    if delete_underlying_file:
+        # ha nincs külön underlying, de a vector_store_file_id file-... akkor jó eséllyel az az OpenAI file id
+        if not underlying_file_id and vector_store_file_id.startswith("file-"):
+            underlying_file_id = vector_store_file_id
 
-        if file_id:
+        if underlying_file_id:
             try:
-                client.files.delete(file_id)
+                client.files.delete(underlying_file_id)
             except Exception:
                 pass
 
-    return {"status": "ok", "deleted_vector_store_file_id": vector_store_file_id}
+    return {"status": "ok", "deleted_vector_store_file_id": vector_store_file_id, "deleted_underlying_file_id": underlying_file_id}
 
 @app.post("/admin/create_vector_store")
 def create_vs(name: str = "Store", x_admin_secret: str = Header(default="")):
     require_admin(x_admin_secret)
     vs = vs_api(client).create(name=name)
     return {"id": vs.id}
+
+# Debug: nyers listázás (ha valaha kell)
 @app.get("/admin/files_raw")
 def admin_files_raw(x_admin_secret: str = Header(default="")):
     require_admin(x_admin_secret)
     require_vs()
-
     items = vs_api(client).files.list(vector_store_id=OPENAI_VECTOR_STORE_ID, limit=20)
-
-    # nyers dump, hogy lássuk a mezőket (file_id hol van)
-    raw = []
-    for it in items.data:
-        raw.append(obj_to_dict(it))
-
+    raw = [obj_to_dict(it) for it in items.data]
     return {"status": "ok", "raw": raw}
+
