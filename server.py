@@ -29,9 +29,10 @@ SMTP_USER = os.getenv("SMTP_USER", "")
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
 NOTIFY_EMAIL = os.getenv("NOTIFY_EMAIL", "info@videmark.hu")
 
-# (opcionális) beszélgetés napló fájl (Renderen csak akkor marad meg, ha van persistent disk)
+# Log beállítások (Render: /var/data/... ha van persistent disk)
 LOG_ENABLED = os.getenv("LOG_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
-LOG_PATH = os.getenv("LOG_PATH", "./chat_logs.jsonl").strip()  # javaslat: /var/data/chat_logs.jsonl ha van disk
+LOG_PATH = os.getenv("LOG_PATH", "./chat_logs.jsonl").strip()
+LOG_MAX_BYTES = int(os.getenv("LOG_MAX_BYTES", "5242880"))  # 5MB basic rotációhoz
 
 ALLOWED_ORIGINS = [
     o.strip()
@@ -94,7 +95,7 @@ _thread_map: Dict[str, str] = {}
 # ha leadet kértünk, jelöljük
 _lead_pending: Dict[str, bool] = {}
 
-app = FastAPI(title="Videmark Chatbot API v4.6 (anti-hallucination + lead fallback + logs)")
+app = FastAPI(title="Videmark Chatbot API v4.7 (KB + OCR + Logs + Admin)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -167,27 +168,130 @@ def require_vs():
         raise HTTPException(400, "Nincs Vector Store ID (OPENAI_VECTOR_STORE_ID)")
 
 def is_single_keyword(msg: str) -> bool:
-    """
-    1-2 szó (pl. "esküvő", "fotózás", "drón videó") -> ne listázzunk automatikusan árakat,
-    hacsak nem biztos, hogy a tudásbázis konkrétan tartalmazza.
-    """
     s = (msg or "").strip()
     if not s:
         return False
-    # csak betű/szám/ékezet/space
     cleaned = re.sub(r"[^\w\sáéíóöőúüűÁÉÍÓÖŐÚÜŰ-]", " ", s).strip()
     words = [w for w in cleaned.split() if w]
     return 1 <= len(words) <= 2
+
+# ---------------- LOGGING ----------------
+def _rotate_log_if_needed():
+    if not LOG_ENABLED:
+        return
+    try:
+        if os.path.exists(LOG_PATH):
+            size = os.path.getsize(LOG_PATH)
+            if size > LOG_MAX_BYTES:
+                ts = time.strftime("%Y%m%d_%H%M%S")
+                rotated = f"{LOG_PATH}.{ts}.bak"
+                os.rename(LOG_PATH, rotated)
+    except Exception:
+        pass
 
 def log_event(event: dict):
     if not LOG_ENABLED:
         return
     try:
+        _rotate_log_if_needed()
         event["ts"] = int(time.time())
         with open(LOG_PATH, "a", encoding="utf-8") as f:
             f.write(json.dumps(event, ensure_ascii=False) + "\n")
     except Exception:
         pass
+
+def read_logs(limit: int = 100, session_id: Optional[str] = None) -> List[dict]:
+    """
+    Egyszerű JSONL olvasás: a végéről olvasunk sok sort,
+    majd szűrünk session_id szerint, és levágjuk limitre.
+    """
+    if not LOG_ENABLED:
+        return []
+
+    if not os.path.exists(LOG_PATH):
+        return []
+
+    # Biztonságos limit
+    limit = max(1, min(int(limit), 500))
+
+    # Olvassunk a végéről kb. N*2 sort, hogy legyen miből szűrni
+    want = limit * 3
+    lines: List[str] = []
+
+    try:
+        with open(LOG_PATH, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            pos = f.tell()
+            buf = b""
+            chunk = 4096
+            while pos > 0 and len(lines) < want:
+                step = min(chunk, pos)
+                pos -= step
+                f.seek(pos)
+                data = f.read(step)
+                buf = data + buf
+                while b"\n" in buf:
+                    i = buf.rfind(b"\n")
+                    line = buf[i + 1:]
+                    buf = buf[:i]
+                    if line.strip():
+                        lines.append(line.decode("utf-8", errors="ignore"))
+                    if len(lines) >= want:
+                        break
+            # maradék
+            if buf.strip() and len(lines) < want:
+                lines.append(buf.decode("utf-8", errors="ignore"))
+    except Exception:
+        # fallback teljes olvasás
+        try:
+            with open(LOG_PATH, "r", encoding="utf-8") as f2:
+                lines = [ln.strip() for ln in f2.readlines() if ln.strip()]
+                lines = list(reversed(lines))[:want]
+        except Exception:
+            return []
+
+    # lines jelenleg "végéről" van gyűjtve, fordítva
+    # rendezzük időrendbe
+    parsed: List[dict] = []
+    for ln in reversed(lines):
+        try:
+            obj = json.loads(ln)
+            if session_id and obj.get("session_id") != session_id:
+                continue
+            parsed.append(obj)
+        except Exception:
+            continue
+
+    # vágás limitre (a legutolsó limit esemény)
+    if len(parsed) > limit:
+        parsed = parsed[-limit:]
+    return parsed
+
+def summarize_sessions(limit: int = 50) -> List[dict]:
+    """
+    Session lista: utolsó N session, utolsó üzenet ideje + darabszám.
+    """
+    events = read_logs(limit=500, session_id=None)
+    # session_id -> stats
+    stats: Dict[str, dict] = {}
+    for ev in events:
+        sid = ev.get("session_id") or ""
+        if not sid:
+            continue
+        s = stats.get(sid) or {"session_id": sid, "last_ts": 0, "count": 0, "last_text": ""}
+        s["count"] += 1
+        ts = int(ev.get("ts") or 0)
+        if ts >= s["last_ts"]:
+            s["last_ts"] = ts
+            # csak user/assistant text
+            if ev.get("type") in ("user", "assistant"):
+                s["last_text"] = (ev.get("text") or "")[:160]
+        stats[sid] = s
+
+    # rendezés last_ts szerint
+    out = sorted(stats.values(), key=lambda x: x["last_ts"], reverse=True)
+    limit = max(1, min(int(limit), 200))
+    return out[:limit]
 
 # ---------------- HTML FORMATTER ----------------
 def format_to_html(text: str) -> str:
@@ -271,12 +375,6 @@ EMAIL_RE = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.I)
 PHONE_RE = re.compile(r"(\+?\d[\d\s().-]{7,}\d)")
 
 def extract_lead_from_text(text: str) -> Optional[dict]:
-    """
-    Egyszerű, robust lead-kiszedés egy szövegből.
-    - email kötelező
-    - telefon opcionális, de ha van, beleírjuk
-    - név: ha van "Név:" vagy első sorban 2-3 szavas név
-    """
     if not text:
         return None
 
@@ -284,27 +382,22 @@ def extract_lead_from_text(text: str) -> Optional[dict]:
     m = EMAIL_RE.search(text)
     if m:
         email = m.group(0).strip()
-
     if not email:
         return None
 
-    phone = None
+    phone = ""
     pm = PHONE_RE.search(text)
     if pm:
         phone = re.sub(r"\s+", " ", pm.group(0)).strip()
 
     name = ""
-    # "Név: ..."
     nm = re.search(r"(?:^|\n)\s*(?:név|nev)\s*:\s*(.+)", text, re.I)
     if nm:
-        name = nm.group(1).strip()
-        name = name.split("\n")[0].strip()
+        name = nm.group(1).strip().split("\n")[0].strip()
 
     if not name:
-        # próbáljuk első sort névként (ha nem email/telefon)
         first_line = (text.strip().splitlines()[0] if text.strip() else "").strip()
         if first_line and not EMAIL_RE.search(first_line) and not PHONE_RE.search(first_line):
-            # max 4 szó
             parts = first_line.split()
             if 1 <= len(parts) <= 4:
                 name = first_line
@@ -314,17 +407,11 @@ def extract_lead_from_text(text: str) -> Optional[dict]:
     if dm:
         desc = dm.group(1).strip()
     else:
-        # ha nincs címkézve, akkor a teljes szöveg legyen leírás (limit)
         desc = text.strip()
         if len(desc) > 800:
             desc = desc[:800] + "..."
 
-    return {
-        "name": name or "Ismeretlen",
-        "email": email,
-        "phone": phone or "",
-        "description": desc,
-    }
+    return {"name": name or "Ismeretlen", "email": email, "phone": phone, "description": desc}
 
 # ---------------- ASSISTANT ----------------
 def get_or_create_assistant():
@@ -358,7 +445,7 @@ def get_or_create_assistant():
         tool_resources = {"file_search": {"vector_store_ids": [OPENAI_VECTOR_STORE_ID]}}
 
     asst = assistants_api(client).create(
-        name="Videmark Assistant V4.6",
+        name="Videmark Assistant V4.7",
         instructions=SYSTEM_PROMPT,
         model=OPENAI_MODEL,
         tools=tools,
@@ -433,7 +520,6 @@ def chat(req: ChatReq, x_chatbot_secret: str = Header(default="")):
         raise HTTPException(401, "Unauthorized")
 
     user_msg = (req.message or "").strip()
-
     log_event({"type": "user", "session_id": req.session_id, "text": user_msg})
 
     # --- EASTER EGGS (csak pontos egyezés) ---
@@ -447,7 +533,7 @@ def chat(req: ChatReq, x_chatbot_secret: str = Header(default="")):
         log_event({"type": "assistant", "session_id": req.session_id, "text": reply})
         return ChatResp(reply=format_to_html(reply))
 
-    # --- LEAD fallback: ha előzőleg LEAD-et kértünk, próbáljuk kiszedni a user üzenetből ---
+    # --- LEAD pending: próbáljuk kiszedni a user szövegből (email kötelező) ---
     if _lead_pending.get(req.session_id):
         lead = extract_lead_from_text(user_msg)
         if lead:
@@ -456,12 +542,9 @@ def chat(req: ChatReq, x_chatbot_secret: str = Header(default="")):
             reply = "Köszi! Megkaptuk az adataid, hamarosan felvesszük veled a kapcsolatot. ✅"
             log_event({"type": "assistant", "session_id": req.session_id, "text": reply, "lead": lead})
             return ChatResp(reply=format_to_html(reply))
-        # ha még nem adott meg elég adatot, menjen tovább a modellhez (de pending marad)
 
-    # --- 1-2 szavas üzenet guard (ne legyen „esküvő” -> árlista) ---
-    # Itt inkább kérjünk pontosítást/LEAD-et, mint hogy rossz irányba menjen.
+    # --- 1-2 szavas guard (pl. "esküvő") ---
     if is_single_keyword(user_msg):
-        # rövid, fix szöveg (nem említ KB-t)
         reply = (
             "Kérlek pontosíts egy kicsit: melyik szolgáltatás érdekel pontosan (videó, drón, fotózás, vágás stb.) "
             "és milyen jellegű projektről van szó?"
@@ -481,17 +564,12 @@ def chat(req: ChatReq, x_chatbot_secret: str = Header(default="")):
 
     threads.messages.create(thread_id=thread_id, role="user", content=user_msg)
 
-    # file_search szigorítás: kevesebb találat, magasabb küszöb
+    # file_search szigorítás (ha az SDK nem fogadja el: töröld a file_search paramot)
     run = threads.runs.create(
         thread_id=thread_id,
         assistant_id=assistant_id,
-        # a "runs" doc szerint lehet file_search override
-        # (ha a te SDK-d ezt nem szereti, simán töröld ezt a blokkot)
         tool_choice="auto",
         tools=[{"type": "file_search"}],
-        # egyes SDK verziókban ez így megy át:
-        # file_search={"max_num_results": 8, "ranking_options": {"score_threshold": 0.55}}
-        # ha hibát adna: vedd ki ezt a sort
         file_search={"max_num_results": 8, "ranking_options": {"score_threshold": 0.55}},
     )
 
@@ -530,6 +608,7 @@ def chat(req: ChatReq, x_chatbot_secret: str = Header(default="")):
     last_msg = messages.data[0]
 
     reply_text = ""
+    raw_text = ""
     if last_msg.role == "assistant":
         raw_parts = []
         for content in last_msg.content:
@@ -537,8 +616,9 @@ def chat(req: ChatReq, x_chatbot_secret: str = Header(default="")):
                 raw_parts.append(content.text.value)
         raw_text = "\n".join(raw_parts).strip()
 
-        # Ha a modell olyan mintát ír, ami LEAD-hez vezet, jelöljük pending-re (a következő user üzenetből szedjük)
-        if "add meg az alábbi adatokat" in raw_text.lower() or "felvesszük veled a kapcsolatot" in raw_text.lower():
+        # lead pending jelölés, ha leadet kér
+        low = raw_text.lower()
+        if "add meg az alábbi adatokat" in low or "felvesszük veled a kapcsolatot" in low:
             _lead_pending[req.session_id] = True
 
         reply_text = format_to_html(raw_text)
@@ -596,7 +676,7 @@ def admin_upload(
 
     return {"status": "ok", "results": results}
 
-# ---------------- ADMIN: FILES LIST (robust) ----------------
+# ---------------- ADMIN: FILES LIST ----------------
 @app.get("/admin/files")
 def admin_files(x_admin_secret: str = Header(default="")):
     require_admin(x_admin_secret)
@@ -611,8 +691,6 @@ def admin_files(x_admin_secret: str = Header(default="")):
         status = getattr(it, "status", "") or d_it.get("status", "")
 
         file_id = None
-
-        # 1) próbáljuk details.retrieve-ből
         try:
             details = vs_api(client).files.retrieve(vector_store_id=OPENAI_VECTOR_STORE_ID, file_id=vs_file_id)
             dd = obj_to_dict(details)
@@ -627,7 +705,6 @@ def admin_files(x_admin_secret: str = Header(default="")):
         except Exception:
             dd = {}
 
-        # 2) ha nem jött, de vs_file_id file-... akkor gyakran maga az OpenAI file id
         if not file_id and isinstance(vs_file_id, str) and vs_file_id.startswith("file-"):
             file_id = vs_file_id
 
@@ -690,7 +767,27 @@ def create_vs(name: str = "Store", x_admin_secret: str = Header(default="")):
     vs = vs_api(client).create(name=name)
     return {"id": vs.id}
 
-# Debug (ha kell)
+# ---------------- ADMIN: LOGS ----------------
+@app.get("/admin/logs")
+def admin_logs(
+    x_admin_secret: str = Header(default=""),
+    session_id: Optional[str] = Query(default=None),
+    limit: int = Query(default=120, ge=1, le=500),
+):
+    require_admin(x_admin_secret)
+    data = read_logs(limit=limit, session_id=session_id)
+    return {"status": "ok", "logs_enabled": LOG_ENABLED, "log_path": LOG_PATH, "logs": data}
+
+@app.get("/admin/log_sessions")
+def admin_log_sessions(
+    x_admin_secret: str = Header(default=""),
+    limit: int = Query(default=50, ge=1, le=200),
+):
+    require_admin(x_admin_secret)
+    sessions = summarize_sessions(limit=limit)
+    return {"status": "ok", "sessions": sessions}
+
+# Debug: nyers listázás (ha kell)
 @app.get("/admin/files_raw")
 def admin_files_raw(x_admin_secret: str = Header(default="")):
     require_admin(x_admin_secret)
