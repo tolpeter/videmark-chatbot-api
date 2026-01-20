@@ -6,7 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 # --------- CONFIG ---------
-PROVIDER = os.getenv("AI_PROVIDER", "gemini")  # "gemini" or "openai"
+PROVIDER = os.getenv("AI_PROVIDER", "openai")  # "gemini" or "openai"
 
 # Gemini
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
