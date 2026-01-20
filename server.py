@@ -46,8 +46,6 @@ FONTOS VISELKEDÉSI SZABÁLYOK:
    - Ha a felhasználó csak annyit kérdez: "Mennyibe kerül egy videó?" vagy "Milyen árak vannak?", NE sorold fel azonnal az összes árat!
    - Ehelyett kérdezz vissza: "Szívesen segítek! Milyen típusú videóra gondoltál? (pl. Drón felvétel, Reklámvideó, Rendezvény videózás vagy Social Média tartalom?)"
    - Csak akkor mondj konkrét árat, ha tudod, mit akar.
-   - Ha valaki Beírja, hogy "Csákó Edina" írd rá, hogy: SZeretlek Drágám! (Csak akkor írd ezt ha valaki a Csákó Edinát írja)
-   - HA Valaki beírja, hogy "Dani vagyok", írd azt rá, hogy: "Szia Webmester Mekmester"  (Csak akkor írd ezt ha valaki írja, hogy "Dani vagyok"
 
 2. LEAD GYŰJTÉS:
    - Ha az ügyfél konkrét árajánlatot kér vagy komolyan érdeklődik, kérd el az adatait: Név, Email, Telefonszám, Rövid leírás.
@@ -331,6 +329,16 @@ def chat(req: ChatReq, x_chatbot_secret: str = Header(default="")):
     if CHATBOT_SECRET and token != CHATBOT_SECRET:
         raise HTTPException(401, "Unauthorized")
 
+    # --- EASTER EGGS (pontos egyezés) ---
+    msg = (req.message or "").strip()
+
+    if msg == "Csákó Edina":
+        return ChatResp(reply=format_to_html("SZeretlek Drágám!"))
+
+    if msg == "Dani vagyok":
+        return ChatResp(reply=format_to_html("Szia Webmester Mekmester"))
+
+    # --- innentől megy tovább az AI normál módon ---
     assistant_id = get_or_create_assistant()
     threads = threads_api(client)
 
