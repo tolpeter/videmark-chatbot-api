@@ -4,9 +4,8 @@ import json
 import re
 import smtplib
 import base64
-from io import BytesIO
 from email.mime.text import MIMEText
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, List
 
 import fitz  # PyMuPDF
 from fastapi import FastAPI, UploadFile, File, Header, HTTPException, Query
@@ -30,7 +29,9 @@ SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
 NOTIFY_EMAIL = os.getenv("NOTIFY_EMAIL", "info@videmark.hu")
 
 ALLOWED_ORIGINS = [
-    o.strip() for o in os.getenv("ALLOWED_ORIGINS", "https://videmark.hu,https://www.videmark.hu").split(",") if o.strip()
+    o.strip()
+    for o in os.getenv("ALLOWED_ORIGINS", "https://videmark.hu,https://www.videmark.hu").split(",")
+    if o.strip()
 ]
 
 # --- ITT TANÍTJUK AZ AI-T (PROMPT) ---
@@ -63,7 +64,7 @@ Stílus: Magyar, közvetlen, segítőkész, rövid és lényegretörő.
 client = OpenAI(api_key=OPENAI_API_KEY)
 _thread_map: Dict[str, str] = {}
 
-app = FastAPI(title="Videmark Chatbot API v4.2 (KB + OCR + Admin files)")
+app = FastAPI(title="Videmark Chatbot API v4.3 (KB + OCR + Admin files, compat)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -73,6 +74,33 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ---------------- OPENAI COMPAT LAYER ----------------
+def vs_api(_client: OpenAI):
+    """
+    Kompatibilitás különböző openai csomag verziókhoz.
+    - újabb: client.beta.vector_stores
+    - egyes verziók: client.vector_stores
+    """
+    if hasattr(_client, "beta") and hasattr(_client.beta, "vector_stores"):
+        return _client.beta.vector_stores
+    if hasattr(_client, "vector_stores"):
+        return _client.vector_stores
+    raise HTTPException(
+        500,
+        "OpenAI python csomag túl régi: nincs vector_stores. Frissítsd requirements.txt-ben: openai>=1.55.0 és Renderen 'Clear build cache & deploy'."
+    )
+
+def assistants_api(_client: OpenAI):
+    if hasattr(_client, "beta") and hasattr(_client.beta, "assistants"):
+        return _client.beta.assistants
+    raise HTTPException(500, "OpenAI beta assistants nem elérhető ebben a csomag verzióban. Frissíts: openai>=1.55.0")
+
+def threads_api(_client: OpenAI):
+    if hasattr(_client, "beta") and hasattr(_client.beta, "threads"):
+        return _client.beta.threads
+    raise HTTPException(500, "OpenAI beta threads nem elérhető ebben a csomag verzióban. Frissíts: openai>=1.55.0")
+
+# ---------------- MODELS ----------------
 class ChatReq(BaseModel):
     message: str
     session_id: str
@@ -81,13 +109,13 @@ class ChatReq(BaseModel):
 class ChatResp(BaseModel):
     reply: str
 
-# ---------------- SAJÁT HTML FORMÁZÓ (NEM KELL KÜLSŐ FÁJL) ----------------
+# ---------------- SAJÁT HTML FORMÁZÓ ----------------
 def format_to_html(text: str) -> str:
     """Átalakítja a Markdown jeleket szép HTML kódra a szerveren."""
     if not text:
         return ""
 
-    # 1. Hivatkozások tisztítása
+    # Hivatkozások tisztítása (assistants hivatkozás jelölések)
     text = re.sub(r'【.*?】', '', text)
 
     lines = text.split('\n')
@@ -196,8 +224,8 @@ def get_or_create_assistant():
     if OPENAI_VECTOR_STORE_ID:
         tool_resources = {"file_search": {"vector_store_ids": [OPENAI_VECTOR_STORE_ID]}}
 
-    asst = client.beta.assistants.create(
-        name="Videmark Assistant V4.2",
+    asst = assistants_api(client).create(
+        name="Videmark Assistant V4.3",
         instructions=SYSTEM_PROMPT,
         model=OPENAI_MODEL,
         tools=tools,
@@ -221,7 +249,6 @@ def ocr_image_with_openai(image_bytes: bytes, mime: str = "image/png") -> str:
     """
     data_url = f"data:{mime};base64," + base64.b64encode(image_bytes).decode("utf-8")
 
-    # Chat Completions vision (stabil)
     resp = client.chat.completions.create(
         model=OPENAI_MODEL,
         messages=[
@@ -276,7 +303,7 @@ def upload_text_as_file_to_vector_store(text: str, filename: str) -> dict:
 
     content = text.encode("utf-8", errors="ignore")
     f = client.files.create(file=(filename, content), purpose="assistants")
-    vsf = client.beta.vector_stores.files.create(vector_store_id=OPENAI_VECTOR_STORE_ID, file_id=f.id)
+    vsf = vs_api(client).files.create(vector_store_id=OPENAI_VECTOR_STORE_ID, file_id=f.id)
     return {"file_id": f.id, "vector_store_file_id": vsf.id, "filename": filename}
 
 # ---------------- ENDPOINTS ----------------
@@ -292,22 +319,20 @@ def chat(req: ChatReq, x_chatbot_secret: str = Header(default="")):
 
     assistant_id = get_or_create_assistant()
 
+    threads = threads_api(client)
+
     thread_id = _thread_map.get(req.session_id)
     if not thread_id:
-        thread = client.beta.threads.create()
+        thread = threads.create()
         thread_id = thread.id
         _thread_map[req.session_id] = thread_id
 
-    client.beta.threads.messages.create(
-        thread_id=thread_id, role="user", content=req.message
-    )
+    threads.messages.create(thread_id=thread_id, role="user", content=req.message)
 
-    run = client.beta.threads.runs.create(
-        thread_id=thread_id, assistant_id=assistant_id
-    )
+    run = threads.runs.create(thread_id=thread_id, assistant_id=assistant_id)
 
     while True:
-        run_status = client.beta.threads.runs.retrieve(thread_id=thread_id, run_id=run.id)
+        run_status = threads.runs.retrieve(thread_id=thread_id, run_id=run.id)
         if run_status.status == 'completed':
             break
         elif run_status.status == 'requires_action':
@@ -318,20 +343,18 @@ def chat(req: ChatReq, x_chatbot_secret: str = Header(default="")):
                         args = json.loads(tool_call.function.arguments)
                         send_email_notification(args)
                         output_str = '{"success": true, "message": "Email elküldve."}'
-                    except:
+                    except Exception:
                         output_str = '{"success": false}'
                     tool_outputs.append({"tool_call_id": tool_call.id, "output": output_str})
 
             if tool_outputs:
-                client.beta.threads.runs.submit_tool_outputs(
-                    thread_id=thread_id, run_id=run.id, tool_outputs=tool_outputs
-                )
+                threads.runs.submit_tool_outputs(thread_id=thread_id, run_id=run.id, tool_outputs=tool_outputs)
             continue
         elif run_status.status in ['failed', 'cancelled', 'expired']:
             return ChatResp(reply="Hiba történt. Próbáld újra.")
         time.sleep(0.5)
 
-    messages = client.beta.threads.messages.list(thread_id=thread_id)
+    messages = threads.messages.list(thread_id=thread_id)
     last_msg = messages.data[0]
 
     reply_text = ""
@@ -348,15 +371,25 @@ def chat(req: ChatReq, x_chatbot_secret: str = Header(default="")):
 # ---------------- ADMIN: UPLOAD (több fájl) ----------------
 @app.post("/admin/upload")
 def admin_upload(
-    files: List[UploadFile] = File(...),
+    files: List[UploadFile] = File(default=[]),
+    files_arr: List[UploadFile] = File(default=[], alias="files[]"),
     x_admin_secret: str = Header(default=""),
     ocr: bool = Query(default=True, description="Ha true, képeknél/szkennelt PDF-nél OCR-t készít és .txt-t tölt fel.")
 ):
     require_admin(x_admin_secret)
     require_vs()
 
+    all_files: List[UploadFile] = []
+    if files:
+        all_files.extend(files)
+    if files_arr:
+        all_files.extend(files_arr)
+
+    if not all_files:
+        raise HTTPException(422, "No files provided. Expected 'files' (or legacy 'files[]').")
+
     results = []
-    for file in files:
+    for file in all_files:
         raw = file.file.read()
         filename = file.filename or "upload.bin"
         content_type = (file.content_type or "").lower()
@@ -365,24 +398,37 @@ def admin_upload(
         if ocr and content_type.startswith("image/"):
             text = ocr_image_with_openai(raw, mime=content_type or "image/png")
             txt_name = re.sub(r'\.[a-z0-9]+$', '', filename, flags=re.I) + "_OCR.txt"
-            results.append({"source": filename, "mode": "image_ocr", "uploaded": upload_text_as_file_to_vector_store(text, txt_name)})
+            results.append({
+                "source": filename,
+                "mode": "image_ocr",
+                "uploaded": upload_text_as_file_to_vector_store(text, txt_name)
+            })
             continue
 
         # 2) PDF: először próbálunk sima text extractet
-        if ocr and content_type in ("application/pdf", "application/x-pdf") or filename.lower().endswith(".pdf"):
+        is_pdf = (content_type in ("application/pdf", "application/x-pdf")) or filename.lower().endswith(".pdf")
+        if ocr and is_pdf:
             extracted = extract_text_from_pdf(raw)
             if len(extracted.strip()) >= 80:
                 txt_name = re.sub(r'\.pdf$', '', filename, flags=re.I) + "_TEXT.txt"
-                results.append({"source": filename, "mode": "pdf_text_extract", "uploaded": upload_text_as_file_to_vector_store(extracted, txt_name)})
+                results.append({
+                    "source": filename,
+                    "mode": "pdf_text_extract",
+                    "uploaded": upload_text_as_file_to_vector_store(extracted, txt_name)
+                })
             else:
                 ocred = ocr_pdf_with_openai(raw)
                 txt_name = re.sub(r'\.pdf$', '', filename, flags=re.I) + "_OCR.txt"
-                results.append({"source": filename, "mode": "pdf_ocr", "uploaded": upload_text_as_file_to_vector_store(ocred, txt_name)})
+                results.append({
+                    "source": filename,
+                    "mode": "pdf_ocr",
+                    "uploaded": upload_text_as_file_to_vector_store(ocred, txt_name)
+                })
             continue
 
         # 3) Minden más (docx/txt/md/html): mehet simán file-ként a vector store-ba
         f = client.files.create(file=(filename, raw), purpose="assistants")
-        vsf = client.beta.vector_stores.files.create(vector_store_id=OPENAI_VECTOR_STORE_ID, file_id=f.id)
+        vsf = vs_api(client).files.create(vector_store_id=OPENAI_VECTOR_STORE_ID, file_id=f.id)
         results.append({"source": filename, "mode": "direct", "file_id": f.id, "vector_store_file_id": vsf.id})
 
     return {"status": "ok", "results": results}
@@ -393,12 +439,10 @@ def admin_files(x_admin_secret: str = Header(default="")):
     require_admin(x_admin_secret)
     require_vs()
 
-    items = client.beta.vector_stores.files.list(vector_store_id=OPENAI_VECTOR_STORE_ID, limit=100)
+    items = vs_api(client).files.list(vector_store_id=OPENAI_VECTOR_STORE_ID, limit=100)
 
     out = []
     for it in items.data:
-        # it.id = vector_store_file_id
-        # it.file_id = openai file_id
         try:
             fmeta = client.files.retrieve(it.file_id)
             fname = getattr(fmeta, "filename", "") or ""
@@ -415,7 +459,6 @@ def admin_files(x_admin_secret: str = Header(default="")):
             "created_at": created_at
         })
 
-    # created_at lehet unix timestamp
     return {"status": "ok", "files": out}
 
 # ---------------- ADMIN: DELETE FROM VECTOR STORE (+ optional delete underlying file) ----------------
@@ -428,22 +471,15 @@ def admin_delete_file(
     require_admin(x_admin_secret)
     require_vs()
 
-    # előbb lekérjük, hogy mi a file_id
+    # előbb lekérjük, hogy mi a file_id (ha sikerül)
     try:
-        vs_item = client.beta.vector_stores.files.retrieve(
-            vector_store_id=OPENAI_VECTOR_STORE_ID,
-            file_id=vector_store_file_id
-        )
+        vs_item = vs_api(client).files.retrieve(vector_store_id=OPENAI_VECTOR_STORE_ID, file_id=vector_store_file_id)
     except Exception:
         vs_item = None
 
-    # törlés a vector store-ból
-    client.beta.vector_stores.files.delete(
-        vector_store_id=OPENAI_VECTOR_STORE_ID,
-        file_id=vector_store_file_id
-    )
+    vs_api(client).files.delete(vector_store_id=OPENAI_VECTOR_STORE_ID, file_id=vector_store_file_id)
 
-    # opcionálisan OpenAI Files-ból is törlés (nem kötelező)
+    # opcionálisan OpenAI Files-ból is törlés
     if delete_underlying_file and vs_item and getattr(vs_item, "file_id", None):
         try:
             client.files.delete(vs_item.file_id)
@@ -455,5 +491,6 @@ def admin_delete_file(
 @app.post("/admin/create_vector_store")
 def create_vs(name: str = "Store", x_admin_secret: str = Header(default="")):
     require_admin(x_admin_secret)
-    vs = client.beta.vector_stores.create(name=name)
+    vs = vs_api(client).create(name=name)
     return {"id": vs.id}
+
