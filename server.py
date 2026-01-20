@@ -504,3 +504,16 @@ def create_vs(name: str = "Store", x_admin_secret: str = Header(default="")):
     require_admin(x_admin_secret)
     vs = vs_api(client).create(name=name)
     return {"id": vs.id}
+@app.get("/admin/files_raw")
+def admin_files_raw(x_admin_secret: str = Header(default="")):
+    require_admin(x_admin_secret)
+    require_vs()
+
+    items = vs_api(client).files.list(vector_store_id=OPENAI_VECTOR_STORE_ID, limit=20)
+
+    # nyers dump, hogy lássuk a mezőket (file_id hol van)
+    raw = []
+    for it in items.data:
+        raw.append(obj_to_dict(it))
+
+    return {"status": "ok", "raw": raw}
