@@ -33,7 +33,7 @@ ALLOWED_ORIGINS = [
 
 SYSTEM_PROMPT = """
 Te a Videmark weboldal hivatalos, barátságos asszisztense vagy.
-Szolgáltatások: Drón videó/fotó, reklámvideó, short tartalom (TikTok/Reels), fotózás.
+Szolgáltatások: Drón videó/fotó, reklámvideó, short tartalom (TikTok/Reels), fotózás, 360 dokos virtuális séták, AI megoldások, social média kezelés, weboldal karbantartás
 
 Feladatod:
 1. Válaszolj kérdésekre a tudásbázis (fájlok) alapján.
