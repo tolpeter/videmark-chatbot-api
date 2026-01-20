@@ -1,8 +1,9 @@
 import os
 import time
 import json
-import re  # <--- FONTOS: Ez kell a tisztításhoz!
+import re
 import smtplib
+import markdown  # <--- EZ AZ ÚJ VARÁZSLAT
 from email.mime.text import MIMEText
 from typing import Optional, Dict, Any, List
 
@@ -16,7 +17,6 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
 OPENAI_VECTOR_STORE_ID = os.getenv("OPENAI_VECTOR_STORE_ID", "").strip()
 OPENAI_ASSISTANT_ID = os.getenv("OPENAI_ASSISTANT_ID", "").strip()
-
 CHATBOT_SECRET = os.getenv("CHATBOT_SECRET", "").strip()
 ADMIN_SECRET = os.getenv("ADMIN_SECRET", "").strip()
 
@@ -33,12 +33,12 @@ ALLOWED_ORIGINS = [
 
 SYSTEM_PROMPT = """
 Te a Videmark weboldal hivatalos, barátságos asszisztense vagy.
-Szolgáltatások: Drón videó/fotó, reklámvideó, short tartalom (TikTok/Reels), fotózás, 360 dokos virtuális séták, AI megoldások, social média kezelés, weboldal karbantartás
+Szolgáltatások: Drón videó/fotó, reklámvideó, short tartalom (TikTok/Reels), fotózás.
 
 Feladatod:
-1. Válaszolj kérdésekre a tudásbázis (fájlok) alapján.
-2. Formázd a válaszaidat szépen: használj felsorolásokat (bullet points), új sorokat és emeld ki félkövérrel a lényeget (árakat).
-3. LEAD GYŰJTÉS: Ha az ügyfél érdeklődik, kérd el: Név, Email, Telefonszám, Projekt leírása. Ha megkaptad, hívd a 'save_lead' funkciót.
+1. Válaszolj kérdésekre a tudásbázis alapján.
+2. Formázás: Használj Markdown formázást! (### Címsor, **Félkövér**, - Lista elem).
+3. LEAD GYŰJTÉS: Ha az ügyfél érdeklődik, kérd el: Név, Email, Telefonszám, Leírás. Ha megvan, hívd a 'save_lead' funkciót.
 
 Stílus: Magyar, tegező, segítőkész.
 """.strip()
@@ -46,7 +46,7 @@ Stílus: Magyar, tegező, segítőkész.
 client = OpenAI(api_key=OPENAI_API_KEY)
 _thread_map: Dict[str, str] = {}
 
-app = FastAPI(title="Videmark Chatbot API v2.2")
+app = FastAPI(title="Videmark Chatbot API v3.0 (HTML)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -141,7 +141,7 @@ def get_or_create_assistant():
 
 @app.get("/")
 def root():
-    return {"status": "ok", "model": OPENAI_MODEL}
+    return {"status": "ok", "mode": "HTML server-side rendering"}
 
 @app.post("/chat", response_model=ChatResp)
 def chat(req: ChatReq, x_chatbot_secret: str = Header(default="")):
@@ -188,7 +188,7 @@ def chat(req: ChatReq, x_chatbot_secret: str = Header(default="")):
             return ChatResp(reply="Hiba történt. Próbáld újra.")
         time.sleep(0.5)
 
-    # VÁLASZ TISZTÍTÁSA (REGEX)
+    # VÁLASZ TISZTÍTÁSA ÉS HTML KONVERTÁLÁS
     messages = client.beta.threads.messages.list(thread_id=thread_id)
     last_msg = messages.data[0]
     
@@ -198,10 +198,16 @@ def chat(req: ChatReq, x_chatbot_secret: str = Header(default="")):
         for content in last_msg.content:
             if content.type == 'text':
                 val = content.text.value
-                # 1. Annotációk törlése (【4:0†source】)
+                # 1. Annotációk törlése
                 val = re.sub(r'【.*?】', '', val)
                 parts.append(val)
-        reply_text = "\n".join(parts)
+        
+        raw_text = "\n".join(parts)
+        
+        # 2. ITT A LÉNYEG: Markdown -> HTML átalakítás a szerveren!
+        # Ez csinál a **-ból <b>-t, a listából <ul>-t.
+        html_reply = markdown.markdown(raw_text)
+        reply_text = html_reply
 
     return ChatResp(reply=reply_text)
 
