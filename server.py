@@ -4,10 +4,12 @@ import json
 import re
 import smtplib
 import base64
+from io import BytesIO
 from email.mime.text import MIMEText
 from typing import Optional, Dict, Any, List
 
-from fastapi import FastAPI, Request, UploadFile, File, Header, HTTPException, Query
+import fitz  # PyMuPDF
+from fastapi import FastAPI, UploadFile, File, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from openai import OpenAI
@@ -15,10 +17,6 @@ from openai import OpenAI
 # ---------------- CONFIG ----------------
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
-
-# OCR/vision modell (külön választható)
-OPENAI_OCR_MODEL = os.getenv("OPENAI_OCR_MODEL", "gpt-4o-mini").strip()
-
 OPENAI_VECTOR_STORE_ID = os.getenv("OPENAI_VECTOR_STORE_ID", "").strip()
 OPENAI_ASSISTANT_ID = os.getenv("OPENAI_ASSISTANT_ID", "").strip()
 CHATBOT_SECRET = os.getenv("CHATBOT_SECRET", "").strip()
@@ -39,7 +37,8 @@ ALLOWED_ORIGINS = [
 SYSTEM_PROMPT = """
 Te a Videmark weboldal profi értékesítő asszisztense vagy.
 
-TUDÁSBÁZIS: Használd a feltöltött fájlokat a válaszadáshoz.
+TUDÁSBÁZIS: A válaszaidhoz elsődlegesen a feltöltött fájlok tartalmát használd (file_search).
+Ha a tudásbázisban nem találsz információt, mondd meg őszintén és kérj pontosítást.
 
 FONTOS VISELKEDÉSI SZABÁLYOK:
 1. PONTOSÍTÁS (Nagyon fontos!):
@@ -64,7 +63,7 @@ Stílus: Magyar, közvetlen, segítőkész, rövid és lényegretörő.
 client = OpenAI(api_key=OPENAI_API_KEY)
 _thread_map: Dict[str, str] = {}
 
-app = FastAPI(title="Videmark Chatbot API v4.1")
+app = FastAPI(title="Videmark Chatbot API v4.2 (KB + OCR + Admin files)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -103,6 +102,7 @@ def format_to_html(text: str) -> str:
                 in_list = False
             continue
 
+        # Lista kezelés (- elem)
         if line.startswith("- ") or line.startswith("* "):
             if not in_list:
                 html_lines.append('<ul style="margin: 5px 0 10px 20px; padding: 0;">')
@@ -111,6 +111,7 @@ def format_to_html(text: str) -> str:
             content = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', content)
             html_lines.append(f'<li style="margin-bottom: 5px; list-style: disc;">{content}</li>')
 
+        # Címsor kezelés (###)
         elif line.startswith("###"):
             if in_list:
                 html_lines.append("</ul>")
@@ -148,7 +149,7 @@ Telefon: {lead_data.get('phone')}
 Leírás: {lead_data.get('description')}
 
 Dátum: {time.strftime('%Y-%m-%d %H:%M:%S')}
-""".strip()
+"""
 
     msg = MIMEText(body, 'plain', 'utf-8')
     msg['Subject'] = subject
@@ -196,7 +197,7 @@ def get_or_create_assistant():
         tool_resources = {"file_search": {"vector_store_ids": [OPENAI_VECTOR_STORE_ID]}}
 
     asst = client.beta.assistants.create(
-        name="Videmark Assistant V4",
+        name="Videmark Assistant V4.2",
         instructions=SYSTEM_PROMPT,
         model=OPENAI_MODEL,
         tools=tools,
@@ -205,89 +206,83 @@ def get_or_create_assistant():
     OPENAI_ASSISTANT_ID = asst.id
     return OPENAI_ASSISTANT_ID
 
-def _require_admin(x_admin_secret: str):
+def require_admin(x_admin_secret: str):
     if ADMIN_SECRET and x_admin_secret != ADMIN_SECRET:
-        raise HTTPException(401, "Unauthorized")
+        raise HTTPException(401, "Unauthorized (admin)")
+
+def require_vs():
     if not OPENAI_VECTOR_STORE_ID:
-        raise HTTPException(400, "Nincs Vector Store ID (OPENAI_VECTOR_STORE_ID).")
+        raise HTTPException(400, "Nincs Vector Store ID (OPENAI_VECTOR_STORE_ID)")
 
-def _upload_bytes_to_vector_store(filename: str, data: bytes):
-    """Feltölt bytes-t OpenAI Files-ba, majd csatolja a Vector Store-hoz."""
-    f = client.files.create(file=(filename, data), purpose="assistants")
-    client.beta.vector_stores.files.create(vector_store_id=OPENAI_VECTOR_STORE_ID, file_id=f.id)
-    return f.id
+def ocr_image_with_openai(image_bytes: bytes, mime: str = "image/png") -> str:
+    """
+    OCR OpenAI vision segítségével.
+    A kimenet csak a kinyert szöveg (nincs magyarázat).
+    """
+    data_url = f"data:{mime};base64," + base64.b64encode(image_bytes).decode("utf-8")
 
-def _ocr_image_to_text_bytes(filename: str, image_bytes: bytes) -> bytes:
-    """Képből szöveg kinyerése OpenAI vision segítségével, majd txt bytes."""
-    b64 = base64.b64encode(image_bytes).decode("utf-8")
-    prompt = (
-        "Olvasd ki a képen található ÖSSZES szöveget pontosan. "
-        "Tartsd meg a bekezdéseket és felsorolásokat, ha vannak. "
-        "Ne magyarázz, csak a kinyert szöveget add vissza."
+    # Chat Completions vision (stabil)
+    resp = client.chat.completions.create(
+        model=OPENAI_MODEL,
+        messages=[
+            {
+                "role": "system",
+                "content": "Feladat: OCR. Add vissza kizárólag a képen látható szöveget. Ne magyarázz. Ne adj hozzá semmit."
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Írd ki pontosan a képen lévő szöveget (sorokkal együtt, ha van)."},
+                    {"type": "image_url", "image_url": {"url": data_url}},
+                ],
+            },
+        ],
+        temperature=0
     )
 
-    # Responses API (vision)
-    resp = client.responses.create(
-        model=OPENAI_OCR_MODEL,
-        input=[{
-            "role": "user",
-            "content": [
-                {"type": "input_text", "text": prompt},
-                {"type": "input_image", "image_base64": b64},
-            ],
-        }],
-    )
+    return (resp.choices[0].message.content or "").strip()
 
-    # Összefűzzük a text outputot
-    out_text_parts = []
-    for item in resp.output:
-        if item.type == "message":
-            for c in item.content:
-                if c.type == "output_text":
-                    out_text_parts.append(c.text)
-    text = ("\n".join(out_text_parts)).strip()
+def extract_text_from_pdf(pdf_bytes: bytes) -> str:
+    """Kinyeri a szöveget szöveges PDF-ből (ha van benne selectable text)."""
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    parts = []
+    for i in range(len(doc)):
+        t = doc[i].get_text("text") or ""
+        if t.strip():
+            parts.append(t)
+    return "\n".join(parts).strip()
 
-    if not text:
-        text = "(Nem sikerült szöveget kinyerni a képből.)"
-
-    # Adjunk egy kis fejléces kontextust
-    final = f"FORRÁS KÉP: {filename}\n\n{text}\n"
-    return final.encode("utf-8")
-
-def _extract_pdf_text_bytes(filename: str, pdf_bytes: bytes) -> Optional[bytes]:
+def ocr_pdf_with_openai(pdf_bytes: bytes) -> str:
     """
-    PDF-ből szöveg kinyerése (ha van beágyazott text).
-    Szkennelt PDF esetén ez gyakran üres – olyankor None-t adunk.
+    Szkennelt PDF OCR: minden oldalból képet renderel, és OpenAI vision OCR-t futtat.
     """
-    try:
-        from pypdf import PdfReader  # pip: pypdf
-    except Exception:
-        return None
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    out = []
+    for i in range(len(doc)):
+        pix = doc[i].get_pixmap(dpi=200)
+        img_bytes = pix.tobytes("png")
+        page_text = ocr_image_with_openai(img_bytes, mime="image/png")
+        if page_text.strip():
+            out.append(f"--- PAGE {i+1} ---\n{page_text}")
+    return "\n\n".join(out).strip()
 
-    try:
-        import io
-        reader = PdfReader(io.BytesIO(pdf_bytes))
-        parts = []
-        for i, page in enumerate(reader.pages):
-            try:
-                t = page.extract_text() or ""
-            except Exception:
-                t = ""
-            t = t.strip()
-            if t:
-                parts.append(f"--- OLDAL {i+1} ---\n{t}\n")
-        text = "\n".join(parts).strip()
-        if len(text) < 200:
-            return None
-        final = f"FORRÁS PDF: {filename}\n\n{text}\n"
-        return final.encode("utf-8")
-    except Exception:
-        return None
+def upload_text_as_file_to_vector_store(text: str, filename: str) -> dict:
+    """
+    Feltölti a szöveget .txt-ként az OpenAI Files-ba, majd hozzáadja a Vector Store-hoz.
+    """
+    require_vs()
+    if not text.strip():
+        raise HTTPException(400, "Nem sikerült szöveget kinyerni (üres OCR).")
+
+    content = text.encode("utf-8", errors="ignore")
+    f = client.files.create(file=(filename, content), purpose="assistants")
+    vsf = client.beta.vector_stores.files.create(vector_store_id=OPENAI_VECTOR_STORE_ID, file_id=f.id)
+    return {"file_id": f.id, "vector_store_file_id": vsf.id, "filename": filename}
 
 # ---------------- ENDPOINTS ----------------
 @app.get("/")
 def root():
-    return {"status": "ok", "mode": "HTML server-side rendering v4.1"}
+    return {"status": "ok", "mode": "HTML server-side rendering + KB + OCR + Admin files"}
 
 @app.post("/chat", response_model=ChatResp)
 def chat(req: ChatReq, x_chatbot_secret: str = Header(default="")):
@@ -323,13 +318,10 @@ def chat(req: ChatReq, x_chatbot_secret: str = Header(default="")):
                         args = json.loads(tool_call.function.arguments)
                         send_email_notification(args)
                         output_str = '{"success": true, "message": "Email elküldve."}'
-                    except Exception:
+                    except:
                         output_str = '{"success": false}'
+                    tool_outputs.append({"tool_call_id": tool_call.id, "output": output_str})
 
-                    tool_outputs.append({
-                        "tool_call_id": tool_call.id,
-                        "output": output_str
-                    })
             if tool_outputs:
                 client.beta.threads.runs.submit_tool_outputs(
                     thread_id=thread_id, run_id=run.id, tool_outputs=tool_outputs
@@ -348,109 +340,120 @@ def chat(req: ChatReq, x_chatbot_secret: str = Header(default="")):
         for content in last_msg.content:
             if content.type == 'text':
                 raw_parts.append(content.text.value)
-
         raw_text = "\n".join(raw_parts)
         reply_text = format_to_html(raw_text)
 
     return ChatResp(reply=reply_text)
 
-# ----------- ADMIN: upload (bővített: képek OCR + PDF text companion) -----------
+# ---------------- ADMIN: UPLOAD (több fájl) ----------------
 @app.post("/admin/upload")
-def admin_upload(file: UploadFile = File(...), x_admin_secret: str = Header(default="")):
-    _require_admin(x_admin_secret)
+def admin_upload(
+    files: List[UploadFile] = File(...),
+    x_admin_secret: str = Header(default=""),
+    ocr: bool = Query(default=True, description="Ha true, képeknél/szkennelt PDF-nél OCR-t készít és .txt-t tölt fel.")
+):
+    require_admin(x_admin_secret)
+    require_vs()
 
-    filename = file.filename or "upload.bin"
-    data = file.file.read()
-    if not data:
-        raise HTTPException(400, "Üres fájl.")
+    results = []
+    for file in files:
+        raw = file.file.read()
+        filename = file.filename or "upload.bin"
+        content_type = (file.content_type or "").lower()
 
-    content_type = (file.content_type or "").lower()
+        # 1) Kép → OCR → TXT feltöltés
+        if ocr and content_type.startswith("image/"):
+            text = ocr_image_with_openai(raw, mime=content_type or "image/png")
+            txt_name = re.sub(r'\.[a-z0-9]+$', '', filename, flags=re.I) + "_OCR.txt"
+            results.append({"source": filename, "mode": "image_ocr", "uploaded": upload_text_as_file_to_vector_store(text, txt_name)})
+            continue
 
-    # 1) Kép: OCR -> txt feltöltés
-    if content_type.startswith("image/") or filename.lower().endswith((".png", ".jpg", ".jpeg", ".webp")):
-        txt_bytes = _ocr_image_to_text_bytes(filename, data)
-        txt_name = re.sub(r'\.[a-z0-9]+$', '', filename, flags=re.I) + ".txt"
-        new_id = _upload_bytes_to_vector_store(txt_name, txt_bytes)
-        return {"status": "ok", "mode": "image_ocr_to_txt", "file_id": new_id, "stored_as": txt_name}
+        # 2) PDF: először próbálunk sima text extractet
+        if ocr and content_type in ("application/pdf", "application/x-pdf") or filename.lower().endswith(".pdf"):
+            extracted = extract_text_from_pdf(raw)
+            if len(extracted.strip()) >= 80:
+                txt_name = re.sub(r'\.pdf$', '', filename, flags=re.I) + "_TEXT.txt"
+                results.append({"source": filename, "mode": "pdf_text_extract", "uploaded": upload_text_as_file_to_vector_store(extracted, txt_name)})
+            else:
+                ocred = ocr_pdf_with_openai(raw)
+                txt_name = re.sub(r'\.pdf$', '', filename, flags=re.I) + "_OCR.txt"
+                results.append({"source": filename, "mode": "pdf_ocr", "uploaded": upload_text_as_file_to_vector_store(ocred, txt_name)})
+            continue
 
-    # 2) PDF: feltöltjük a PDF-et + ha van kinyerhető szöveg, feltöltünk PDFname.txt-t is
-    if content_type == "application/pdf" or filename.lower().endswith(".pdf"):
-        pdf_id = _upload_bytes_to_vector_store(filename, data)
+        # 3) Minden más (docx/txt/md/html): mehet simán file-ként a vector store-ba
+        f = client.files.create(file=(filename, raw), purpose="assistants")
+        vsf = client.beta.vector_stores.files.create(vector_store_id=OPENAI_VECTOR_STORE_ID, file_id=f.id)
+        results.append({"source": filename, "mode": "direct", "file_id": f.id, "vector_store_file_id": vsf.id})
 
-        pdf_txt = _extract_pdf_text_bytes(filename, data)
-        txt_id = None
-        stored_txt = None
-        if pdf_txt:
-            stored_txt = re.sub(r'\.pdf$', '', filename, flags=re.I) + ".txt"
-            txt_id = _upload_bytes_to_vector_store(stored_txt, pdf_txt)
+    return {"status": "ok", "results": results}
 
-        return {
-            "status": "ok",
-            "mode": "pdf_plus_optional_txt",
-            "pdf_file_id": pdf_id,
-            "txt_file_id": txt_id,
-            "txt_stored_as": stored_txt
-        }
-
-    # 3) Egyéb (doc/docx/txt/md/html…): sima feltöltés
-    new_id = _upload_bytes_to_vector_store(filename, data)
-    return {"status": "ok", "mode": "raw_upload", "file_id": new_id, "stored_as": filename}
-
-# ----------- ADMIN: list files -----------
+# ---------------- ADMIN: FILES LIST ----------------
 @app.get("/admin/files")
-def admin_files(x_admin_secret: str = Header(default=""), limit: int = 100):
-    _require_admin(x_admin_secret)
+def admin_files(x_admin_secret: str = Header(default="")):
+    require_admin(x_admin_secret)
+    require_vs()
 
-    # Vector store file entries
-    vs_files = client.beta.vector_stores.files.list(vector_store_id=OPENAI_VECTOR_STORE_ID, limit=limit)
+    items = client.beta.vector_stores.files.list(vector_store_id=OPENAI_VECTOR_STORE_ID, limit=100)
 
-    items = []
-    for it in vs_files.data:
-        file_id = it.id  # vector store file id OR file id? (OpenAI lib: vs file item id is file_id)
-        # Biztos ami biztos: próbáljuk fájl meta lekéréssel
+    out = []
+    for it in items.data:
+        # it.id = vector_store_file_id
+        # it.file_id = openai file_id
         try:
-            fmeta = client.files.retrieve(file_id)
-            items.append({
-                "file_id": file_id,
-                "filename": getattr(fmeta, "filename", None),
-                "bytes": getattr(fmeta, "bytes", None),
-                "created_at": getattr(fmeta, "created_at", None),
-            })
+            fmeta = client.files.retrieve(it.file_id)
+            fname = getattr(fmeta, "filename", "") or ""
+            created_at = getattr(fmeta, "created_at", None)
         except Exception:
-            items.append({
-                "file_id": file_id,
-                "filename": None,
-                "bytes": None,
-                "created_at": None,
-            })
+            fname = ""
+            created_at = None
 
-    # Legfrissebb elöl
-    items.sort(key=lambda x: (x["created_at"] or 0), reverse=True)
-    return {"status": "ok", "count": len(items), "items": items}
+        out.append({
+            "vector_store_file_id": it.id,
+            "file_id": it.file_id,
+            "status": getattr(it, "status", ""),
+            "filename": fname,
+            "created_at": created_at
+        })
 
-# ----------- ADMIN: delete file -----------
-@app.post("/admin/delete")
-def admin_delete(file_id: str = Query(...), x_admin_secret: str = Header(default="")):
-    _require_admin(x_admin_secret)
+    # created_at lehet unix timestamp
+    return {"status": "ok", "files": out}
 
-    # 1) leválasztás a vector store-ról (ha támogatott)
+# ---------------- ADMIN: DELETE FROM VECTOR STORE (+ optional delete underlying file) ----------------
+@app.delete("/admin/files/{vector_store_file_id}")
+def admin_delete_file(
+    vector_store_file_id: str,
+    x_admin_secret: str = Header(default=""),
+    delete_underlying_file: bool = Query(default=False, description="Ha true, az OpenAI Files-ból is törli a file-t.")
+):
+    require_admin(x_admin_secret)
+    require_vs()
+
+    # előbb lekérjük, hogy mi a file_id
     try:
-        client.beta.vector_stores.files.delete(vector_store_id=OPENAI_VECTOR_STORE_ID, file_id=file_id)
+        vs_item = client.beta.vector_stores.files.retrieve(
+            vector_store_id=OPENAI_VECTOR_STORE_ID,
+            file_id=vector_store_file_id
+        )
     except Exception:
-        # Ha a SDK itt máshogy kezeli, attól még próbáljuk a file delete-et.
-        pass
+        vs_item = None
 
-    # 2) törlés OpenAI Files-ból
-    try:
-        client.files.delete(file_id)
-    except Exception as e:
-        raise HTTPException(400, f"Nem sikerült törölni: {e}")
+    # törlés a vector store-ból
+    client.beta.vector_stores.files.delete(
+        vector_store_id=OPENAI_VECTOR_STORE_ID,
+        file_id=vector_store_file_id
+    )
 
-    return {"status": "ok", "deleted_file_id": file_id}
+    # opcionálisan OpenAI Files-ból is törlés (nem kötelező)
+    if delete_underlying_file and vs_item and getattr(vs_item, "file_id", None):
+        try:
+            client.files.delete(vs_item.file_id)
+        except Exception:
+            pass
+
+    return {"status": "ok", "deleted_vector_store_file_id": vector_store_file_id}
 
 @app.post("/admin/create_vector_store")
 def create_vs(name: str = "Store", x_admin_secret: str = Header(default="")):
-    if ADMIN_SECRET and x_admin_secret != ADMIN_SECRET:
-        raise HTTPException(401)
+    require_admin(x_admin_secret)
     vs = client.beta.vector_stores.create(name=name)
     return {"id": vs.id}
