@@ -4,3 +4,4 @@ requests
 python-multipart
 openai>=1.40.0
 markdown
+pypdf>=5.0.0
