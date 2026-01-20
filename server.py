@@ -6,18 +6,22 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 # --------- CONFIG ---------
-PROVIDER = os.getenv("AI_PROVIDER", "openai")  # "gemini" or "openai"
+PROVIDER = os.getenv("AI_PROVIDER", "openai").strip().lower()  # "gemini" or "openai"
 
 # Gemini
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash").strip()
 
-# OpenAI (ha később kell)
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+# OpenAI
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini").strip()
 
 # CORS (csak a te oldalaid)
-ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "https://videmark.hu,https://www.videmark.hu").split(",")
+ALLOWED_ORIGINS = [
+    o.strip()
+    for o in os.getenv("ALLOWED_ORIGINS", "https://videmark.hu,https://www.videmark.hu").split(",")
+    if o.strip()
+]
 
 SYSTEM_PROMPT = """
 Te a Videmark weboldal hivatalos asszisztense vagy.
@@ -28,14 +32,14 @@ Stílus:
 - magyarul, tömören, érthetően
 - max 2 kérdés egyszerre
 - javasolj következő lépést (pl. "kérsz gyors árajánlatot?")
-"""
+""".strip()
 
 # --------- APP ---------
 app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[o.strip() for o in ALLOWED_ORIGINS if o.strip()],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -51,7 +55,7 @@ class ChatResp(BaseModel):
 
 @app.get("/")
 def root():
-    return {"ok": True, "service": "videmark-chatbot-api"}
+    return {"ok": True, "service": "videmark-chatbot-api", "provider": PROVIDER, "model": (OPENAI_MODEL if PROVIDER == "openai" else GEMINI_MODEL)}
 
 def call_gemini(messages: List[Dict[str, str]]) -> str:
     if not GEMINI_API_KEY:
@@ -70,9 +74,13 @@ def call_gemini(messages: List[Dict[str, str]]) -> str:
         "generationConfig": {"temperature": 0.4, "maxOutputTokens": 500},
     }
 
-    r = requests.post(url, json=payload, timeout=30)
+    try:
+        r = requests.post(url, json=payload, timeout=30)
+    except Exception as e:
+        return f"Hiba a Gemini hívásnál (kapcsolat): {str(e)[:200]}"
+
     if r.status_code != 200:
-        return f"Hiba a Gemini hívásnál: {r.status_code} – {r.text[:200]}"
+        return f"Hiba a Gemini hívásnál: {r.status_code} – {r.text[:400]}"
 
     data = r.json()
     try:
@@ -85,33 +93,63 @@ def call_openai(messages: List[Dict[str, str]]) -> str:
         return "Hiányzik az OPENAI_API_KEY a szerveren."
 
     url = "https://api.openai.com/v1/responses"
-    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+    }
 
-    input_msgs = [{"role": "system", "content": [{"type": "input_text", "text": SYSTEM_PROMPT}]}]
-for m in messages:
-    input_msgs.append({"role": m["role"], "content": [{"type": "input_text", "text": m["content"]}]})
+    # Responses API: content item type MUST be 'input_text' (nem 'text')
+    input_msgs = [
+        {"role": "system", "content": [{"type": "input_text", "text": SYSTEM_PROMPT}]}
+    ]
+    for m in messages:
+        input_msgs.append(
+            {"role": m["role"], "content": [{"type": "input_text", "text": m["content"]}]}
+        )
 
-    payload = {"model": OPENAI_MODEL, "input": input_msgs, "temperature": 0.4, "max_output_tokens": 500}
+    payload = {
+        "model": OPENAI_MODEL,
+        "input": input_msgs,
+        "temperature": 0.4,
+        "max_output_tokens": 500,
+    }
 
-    r = requests.post(url, headers=headers, json=payload, timeout=30)
+    try:
+        r = requests.post(url, headers=headers, json=payload, timeout=30)
+    except Exception as e:
+        return f"Hiba az OpenAI hívásnál (kapcsolat): {str(e)[:200]}"
+
     if r.status_code != 200:
-        return f"Hiba az OpenAI hívásnál: {r.status_code} – {r.text[:200]}"
+        return f"Hiba az OpenAI hívásnál: {r.status_code} – {r.text[:400]}"
 
     data = r.json()
+
+    # Leggyakoribb: output_text mezőben visszaadja a kész szöveget
+    if isinstance(data, dict) and data.get("output_text"):
+        return data["output_text"]
+
+    # Fallback: próbáljuk kinyerni az output struktúrából
     try:
-        if "output_text" in data and data["output_text"]:
-            return data["output_text"]
-        return data["output"][0]["content"][0]["text"]
+        out0 = data["output"][0]
+        content0 = out0["content"][0]
+        # néha {"type":"output_text","text":"..."}
+        if isinstance(content0, dict) and "text" in content0:
+            return content0["text"]
     except Exception:
-        return "Nem tudtam választ generálni (OpenAI válasz formátum)."
+        pass
+
+    return "Nem tudtam választ generálni (OpenAI válasz formátum)."
 
 @app.post("/chat", response_model=ChatResp)
 def chat(req: ChatReq):
     history = req.context or []
-    messages = []
+    messages: List[Dict[str, str]] = []
+
     for m in history[-10:]:
-        if m.get("role") in ("user", "assistant") and m.get("content"):
-            messages.append({"role": m["role"], "content": str(m["content"])})
+        role = m.get("role")
+        content = m.get("content")
+        if role in ("user", "assistant") and content:
+            messages.append({"role": role, "content": str(content)})
 
     messages.append({"role": "user", "content": req.message})
 
