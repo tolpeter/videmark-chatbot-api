@@ -2,6 +2,6 @@ fastapi
 uvicorn
 requests
 python-multipart
-openai>=1.40.0
 markdown
 pymupdf
+openai>=1.55.0
