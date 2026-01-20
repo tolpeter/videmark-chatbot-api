@@ -420,25 +420,26 @@ def admin_files(x_admin_secret: str = Header(default="")):
 
     out = []
     for it in items.data:
-        d = obj_to_dict(it)
+        # it.id = vector_store_file_id (pl. file-...)
+        vs_file_id = getattr(it, "id", None) or obj_to_dict(it).get("id")
 
-        # vector_store_file_id
-        vs_file_id = pick(d, ["id", "vector_store_file_id", "vector_store_file"], "")
+        # Itt jön a lényeg: részletek lekérése
+        file_id = None
+        status = getattr(it, "status", "") or obj_to_dict(it).get("status", "")
 
-        # openai file id lehet nested is
-        file_id = pick(d, ["file_id"], None)
-        if not file_id:
-            file_obj = pick(d, ["file"], None)
-            if isinstance(file_obj, dict):
-                file_id = file_obj.get("id") or file_obj.get("file_id")
-            else:
-                # ha objektum
-                try:
-                    file_id = getattr(file_obj, "id", None) or getattr(file_obj, "file_id", None)
-                except Exception:
-                    file_id = None
+        try:
+            details = vs_api(client).files.retrieve(
+                vector_store_id=OPENAI_VECTOR_STORE_ID,
+                file_id=vs_file_id
+            )
+            dd = obj_to_dict(details)
 
-        status = pick(d, ["status"], "")
+            # több lehetséges helyről próbáljuk kinyerni
+            file_id = dd.get("file_id") or dd.get("file", {}).get("id") or dd.get("file", {}).get("file_id")
+            status = dd.get("status") or status
+
+        except Exception:
+            dd = {}
 
         fname = ""
         created_at = None
@@ -459,7 +460,6 @@ def admin_files(x_admin_secret: str = Header(default="")):
         })
 
     return {"status": "ok", "files": out}
-
 # ---------------- ADMIN: DELETE ----------------
 @app.delete("/admin/files/{vector_store_file_id}")
 def admin_delete_file(
