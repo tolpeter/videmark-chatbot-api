@@ -94,7 +94,7 @@ _thread_map: Dict[str, str] = {}
 # ha leadet kértünk, jelöljük
 _lead_pending: Dict[str, bool] = {}
 
-app = FastAPI(title="Videmark Chatbot API v4.6 (anti-hallucination + lead fallback + logs + robust admin)")
+app = FastAPI(title="Videmark Chatbot API v4.7 (limit<=10 fixed + paged listing + logs)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -159,7 +159,6 @@ def safe_get_file_meta(file_id: str) -> dict:
         return {"filename": "", "created_at": None}
 
 def require_admin(x_admin_secret: str):
-    # ha nincs ADMIN_SECRET beállítva, akkor "nyitva" van az admin (nem ajánlott)
     if ADMIN_SECRET and x_admin_secret != ADMIN_SECRET:
         raise HTTPException(401, "Unauthorized (admin)")
 
@@ -184,6 +183,52 @@ def log_event(event: dict):
             f.write(json.dumps(event, ensure_ascii=False) + "\n")
     except Exception:
         pass
+
+# --- FIX: OpenAI vector store list limit MAX 10 -> lapozunk ---
+VS_LIST_PAGE_LIMIT = 10  # az error alapján <=10
+
+def _vs_files_list_paged(max_items: int = 200) -> List[Any]:
+    """
+    Biztonságos listázás: a list() limitje max 10, ezért 'after' paraméterrel lapozunk.
+    """
+    require_vs()
+
+    collected: List[Any] = []
+    after: Optional[str] = None
+
+    # hard safety
+    if max_items < 1:
+        return []
+
+    while len(collected) < max_items:
+        remaining = max_items - len(collected)
+        page_limit = min(VS_LIST_PAGE_LIMIT, remaining)
+
+        kwargs = {"vector_store_id": OPENAI_VECTOR_STORE_ID, "limit": page_limit}
+        if after:
+            kwargs["after"] = after  # OpenAI list pagination
+
+        page = vs_api(client).files.list(**kwargs)
+
+        data = getattr(page, "data", None) or []
+        if not data:
+            break
+
+        collected.extend(data)
+        # next cursor: last item's id
+        last_id = getattr(data[-1], "id", None) or obj_to_dict(data[-1]).get("id")
+        after = last_id
+
+        # ha nincs több:
+        has_more = getattr(page, "has_more", None)
+        if has_more is False:
+            break
+
+        # extra guard: ha nincs last_id, nem tudunk tovább lapozni
+        if not after:
+            break
+
+    return collected
 
 # ---------------- HTML FORMATTER ----------------
 def format_to_html(text: str) -> str:
@@ -340,7 +385,7 @@ def get_or_create_assistant():
         tool_resources = {"file_search": {"vector_store_ids": [OPENAI_VECTOR_STORE_ID]}}
 
     asst = assistants_api(client).create(
-        name="Videmark Assistant V4.6",
+        name="Videmark Assistant V4.7",
         instructions=SYSTEM_PROMPT,
         model=OPENAI_MODEL,
         tools=tools,
@@ -438,7 +483,7 @@ def chat(req: ChatReq, x_chatbot_secret: str = Header(default="")):
             log_event({"type": "assistant", "session_id": req.session_id, "text": reply, "lead": lead})
             return ChatResp(reply=format_to_html(reply))
 
-    # --- 1-2 szavas üzenet guard (ne legyen „esküvő” -> árlista) ---
+    # --- 1-2 szavas üzenet guard ---
     if is_single_keyword(user_msg):
         reply = (
             "Kérlek pontosíts egy kicsit: melyik szolgáltatás érdekel pontosan (videó, drón, fotózás, vágás stb.) "
@@ -447,7 +492,6 @@ def chat(req: ChatReq, x_chatbot_secret: str = Header(default="")):
         log_event({"type": "assistant", "session_id": req.session_id, "text": reply, "guard": "single_keyword"})
         return ChatResp(reply=format_to_html(reply))
 
-    # --- AI normál mód ---
     assistant_id = get_or_create_assistant()
     threads = threads_api(client)
 
@@ -458,13 +502,7 @@ def chat(req: ChatReq, x_chatbot_secret: str = Header(default="")):
         _thread_map[req.session_id] = thread_id
 
     threads.messages.create(thread_id=thread_id, role="user", content=user_msg)
-
-    # Fontos: egyes SDK verziók NEM támogatják a run.create-ben a file_search override-ot.
-    # Ezért biztonságosan nem küldjük el, így nem fog 500-zni.
-    run = threads.runs.create(
-        thread_id=thread_id,
-        assistant_id=assistant_id,
-    )
+    run = threads.runs.create(thread_id=thread_id, assistant_id=assistant_id)
 
     while True:
         run_status = threads.runs.retrieve(thread_id=thread_id, run_id=run.id)
@@ -508,7 +546,6 @@ def chat(req: ChatReq, x_chatbot_secret: str = Header(default="")):
                 raw_parts.append(content.text.value)
         raw_text = "\n".join(raw_parts).strip()
 
-        # Ha a modell LEAD-et kér, jelöljük pending-re
         if "add meg az alábbi adatokat" in raw_text.lower() or "felvesszük veled a kapcsolatot" in raw_text.lower():
             _lead_pending[req.session_id] = True
 
@@ -540,14 +577,12 @@ def admin_upload(
         filename = file.filename or "upload.bin"
         content_type = (file.content_type or "").lower()
 
-        # image OCR -> txt
         if ocr and content_type.startswith("image/"):
             text = ocr_image_with_openai(raw, mime=content_type or "image/png")
             txt_name = re.sub(r"\.[a-z0-9]+$", "", filename, flags=re.I) + "_OCR.txt"
             results.append({"source": filename, "mode": "image_ocr", "uploaded": upload_text_as_file_to_vector_store(text, txt_name)})
             continue
 
-        # PDF -> extract or OCR
         is_pdf = (content_type in ("application/pdf", "application/x-pdf")) or filename.lower().endswith(".pdf")
         if ocr and is_pdf:
             extracted = extract_text_from_pdf(raw)
@@ -560,69 +595,62 @@ def admin_upload(
                 results.append({"source": filename, "mode": "pdf_ocr", "uploaded": upload_text_as_file_to_vector_store(ocred, txt_name)})
             continue
 
-        # direct file
         f = client.files.create(file=(filename, raw), purpose="assistants")
         vsf = vs_api(client).files.create(vector_store_id=OPENAI_VECTOR_STORE_ID, file_id=f.id)
         results.append({"source": filename, "mode": "direct", "file_id": f.id, "vector_store_file_id": getattr(vsf, "id", None)})
 
     return {"status": "ok", "results": results}
 
-# ---------------- ADMIN: FILES LIST (robust + no 500 to WP) ----------------
+# ---------------- ADMIN: FILES LIST (FIXED LIMIT<=10 + paged) ----------------
 @app.get("/admin/files")
-def admin_files(x_admin_secret: str = Header(default="")):
+def admin_files(
+    x_admin_secret: str = Header(default=""),
+    limit: int = Query(default=50, ge=1, le=200),
+):
     require_admin(x_admin_secret)
 
     if not OPENAI_VECTOR_STORE_ID:
         return {"status": "ok", "files": [], "warning": "Nincs OPENAI_VECTOR_STORE_ID a Render ENV-ben."}
 
+    # OpenAI oldali limit max 10, mi pedig lapozva gyűjtjük össze a kért mennyiséget
     try:
-        items = vs_api(client).files.list(vector_store_id=OPENAI_VECTOR_STORE_ID, limit=200)
+        items = _vs_files_list_paged(max_items=min(limit, 200))
     except Exception as e:
         return {"status": "ok", "files": [], "warning": f"OpenAI list hiba: {str(e)}"}
 
     out = []
-    for it in getattr(items, "data", []) or []:
+    for it in items:
+        d_it = obj_to_dict(it)
+        vs_file_id = getattr(it, "id", None) or d_it.get("id") or ""
+        status = getattr(it, "status", "") or d_it.get("status", "")
+
+        file_id = None
         try:
-            d_it = obj_to_dict(it)
-            vs_file_id = getattr(it, "id", None) or d_it.get("id") or ""
-            status = getattr(it, "status", "") or d_it.get("status", "")
+            details = vs_api(client).files.retrieve(vector_store_id=OPENAI_VECTOR_STORE_ID, file_id=vs_file_id)
+            dd = obj_to_dict(details)
+            file_id = (
+                dd.get("file_id")
+                or (dd.get("file") or {}).get("id")
+                or (dd.get("file") or {}).get("file_id")
+                or dd.get("openai_file_id")
+                or dd.get("source_file_id")
+            )
+            status = dd.get("status") or status
+        except Exception:
+            dd = {}
 
-            file_id = None
-            try:
-                details = vs_api(client).files.retrieve(vector_store_id=OPENAI_VECTOR_STORE_ID, file_id=vs_file_id)
-                dd = obj_to_dict(details)
-                file_id = (
-                    dd.get("file_id")
-                    or (dd.get("file") or {}).get("id")
-                    or (dd.get("file") or {}).get("file_id")
-                    or dd.get("openai_file_id")
-                    or dd.get("source_file_id")
-                )
-                status = dd.get("status") or status
-            except Exception:
-                dd = {}
+        if not file_id and isinstance(vs_file_id, str) and vs_file_id.startswith("file-"):
+            file_id = vs_file_id
 
-            if not file_id and isinstance(vs_file_id, str) and vs_file_id.startswith("file-"):
-                file_id = vs_file_id
+        meta = safe_get_file_meta(file_id) if file_id else {"filename": "", "created_at": None}
 
-            meta = safe_get_file_meta(file_id) if file_id else {"filename": "", "created_at": None}
-
-            out.append({
-                "vector_store_file_id": vs_file_id,
-                "file_id": file_id,
-                "status": status,
-                "filename": meta.get("filename", "") or "",
-                "created_at": meta.get("created_at", None),
-            })
-        except Exception as e:
-            out.append({
-                "vector_store_file_id": getattr(it, "id", None) or "",
-                "file_id": None,
-                "status": "error",
-                "filename": "",
-                "created_at": None,
-                "warning": f"Elem feldolgozási hiba: {str(e)}",
-            })
+        out.append({
+            "vector_store_file_id": vs_file_id,
+            "file_id": file_id,
+            "status": status,
+            "filename": meta.get("filename", "") or "",
+            "created_at": meta.get("created_at", None),
+        })
 
     return {"status": "ok", "files": out}
 
@@ -675,12 +703,20 @@ def create_vs(name: str = "Store", x_admin_secret: str = Header(default="")):
 
 # Debug (ha kell)
 @app.get("/admin/files_raw")
-def admin_files_raw(x_admin_secret: str = Header(default="")):
+def admin_files_raw(
+    x_admin_secret: str = Header(default=""),
+    limit: int = Query(default=20, ge=1, le=200),
+):
     require_admin(x_admin_secret)
-    require_vs()
-    items = vs_api(client).files.list(vector_store_id=OPENAI_VECTOR_STORE_ID, limit=20)
-    raw = [obj_to_dict(it) for it in getattr(items, "data", []) or []]
-    return {"status": "ok", "raw": raw}
+    if not OPENAI_VECTOR_STORE_ID:
+        return {"status": "ok", "raw": [], "warning": "Nincs OPENAI_VECTOR_STORE_ID."}
+
+    try:
+        items = _vs_files_list_paged(max_items=min(limit, 200))
+        raw = [obj_to_dict(it) for it in items]
+        return {"status": "ok", "raw": raw}
+    except Exception as e:
+        return {"status": "ok", "raw": [], "warning": str(e)}
 
 # ---------------- ADMIN: LOGS (optional) ----------------
 def read_logs(limit: int = 200, session_id: Optional[str] = None) -> List[dict]:
@@ -714,7 +750,6 @@ def summarize_sessions(limit: int = 50) -> List[dict]:
         counts[sid] = counts.get(sid, 0) + 1
         if sid not in last_by_session or int(e.get("ts", 0)) > int(last_by_session[sid].get("ts", 0)):
             last_by_session[sid] = e
-    # sort by last ts desc
     sessions = sorted(last_by_session.items(), key=lambda kv: int(kv[1].get("ts", 0)), reverse=True)
     out = []
     for sid, last in sessions[:limit]:
