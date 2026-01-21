@@ -5,7 +5,7 @@ import re
 import smtplib
 import base64
 from email.mime.text import MIMEText
-from typing import Optional, Dict, List, Any, Tuple
+from typing import Optional, Dict, List, Any
 
 import fitz  # PyMuPDF
 from fastapi import FastAPI, UploadFile, File, Header, HTTPException, Query
@@ -94,7 +94,7 @@ _thread_map: Dict[str, str] = {}
 # ha leadet kértünk, jelöljük
 _lead_pending: Dict[str, bool] = {}
 
-app = FastAPI(title="Videmark Chatbot API v4.6 (anti-hallucination + lead fallback + logs)")
+app = FastAPI(title="Videmark Chatbot API v4.6 (anti-hallucination + lead fallback + logs + robust admin)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -159,6 +159,7 @@ def safe_get_file_meta(file_id: str) -> dict:
         return {"filename": "", "created_at": None}
 
 def require_admin(x_admin_secret: str):
+    # ha nincs ADMIN_SECRET beállítva, akkor "nyitva" van az admin (nem ajánlott)
     if ADMIN_SECRET and x_admin_secret != ADMIN_SECRET:
         raise HTTPException(401, "Unauthorized (admin)")
 
@@ -167,14 +168,9 @@ def require_vs():
         raise HTTPException(400, "Nincs Vector Store ID (OPENAI_VECTOR_STORE_ID)")
 
 def is_single_keyword(msg: str) -> bool:
-    """
-    1-2 szó (pl. "esküvő", "fotózás", "drón videó") -> ne listázzunk automatikusan árakat,
-    hacsak nem biztos, hogy a tudásbázis konkrétan tartalmazza.
-    """
     s = (msg or "").strip()
     if not s:
         return False
-    # csak betű/szám/ékezet/space
     cleaned = re.sub(r"[^\w\sáéíóöőúüűÁÉÍÓÖŐÚÜŰ-]", " ", s).strip()
     words = [w for w in cleaned.split() if w]
     return 1 <= len(words) <= 2
@@ -193,9 +189,9 @@ def log_event(event: dict):
 def format_to_html(text: str) -> str:
     if not text:
         return ""
-    text = re.sub(r'【.*?】', '', text)
+    text = re.sub(r"【.*?】", "", text)
 
-    lines = text.split('\n')
+    lines = text.split("\n")
     html_lines = []
     in_list = False
 
@@ -211,7 +207,7 @@ def format_to_html(text: str) -> str:
             if not in_list:
                 html_lines.append('<ul style="margin: 5px 0 10px 20px; padding: 0;">')
                 in_list = True
-            content = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', line[2:])
+            content = re.sub(r"\*\*(.*?)\*\*", r"<b>\1</b>", line[2:])
             html_lines.append(f'<li style="margin-bottom: 5px; list-style: disc;">{content}</li>')
 
         elif line.startswith("###"):
@@ -226,7 +222,7 @@ def format_to_html(text: str) -> str:
             if in_list:
                 html_lines.append("</ul>")
                 in_list = False
-            line = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', line)
+            line = re.sub(r"\*\*(.*?)\*\*", r"<b>\1</b>", line)
             html_lines.append(f'<p style="margin: 0 0 8px 0;">{line}</p>')
 
     if in_list:
@@ -252,10 +248,10 @@ Leírás: {lead_data.get('description')}
 Dátum: {time.strftime('%Y-%m-%d %H:%M:%S')}
 """
 
-    msg = MIMEText(body, 'plain', 'utf-8')
-    msg['Subject'] = subject
-    msg['From'] = SMTP_USER
-    msg['To'] = NOTIFY_EMAIL
+    msg = MIMEText(body, "plain", "utf-8")
+    msg["Subject"] = subject
+    msg["From"] = SMTP_USER
+    msg["To"] = NOTIFY_EMAIL
 
     try:
         server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT)
@@ -271,40 +267,27 @@ EMAIL_RE = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.I)
 PHONE_RE = re.compile(r"(\+?\d[\d\s().-]{7,}\d)")
 
 def extract_lead_from_text(text: str) -> Optional[dict]:
-    """
-    Egyszerű, robust lead-kiszedés egy szövegből.
-    - email kötelező
-    - telefon opcionális, de ha van, beleírjuk
-    - név: ha van "Név:" vagy első sorban 2-3 szavas név
-    """
     if not text:
         return None
 
-    email = None
     m = EMAIL_RE.search(text)
-    if m:
-        email = m.group(0).strip()
-
-    if not email:
+    if not m:
         return None
+    email = m.group(0).strip()
 
-    phone = None
+    phone = ""
     pm = PHONE_RE.search(text)
     if pm:
         phone = re.sub(r"\s+", " ", pm.group(0)).strip()
 
     name = ""
-    # "Név: ..."
     nm = re.search(r"(?:^|\n)\s*(?:név|nev)\s*:\s*(.+)", text, re.I)
     if nm:
-        name = nm.group(1).strip()
-        name = name.split("\n")[0].strip()
+        name = nm.group(1).strip().split("\n")[0].strip()
 
     if not name:
-        # próbáljuk első sort névként (ha nem email/telefon)
         first_line = (text.strip().splitlines()[0] if text.strip() else "").strip()
         if first_line and not EMAIL_RE.search(first_line) and not PHONE_RE.search(first_line):
-            # max 4 szó
             parts = first_line.split()
             if 1 <= len(parts) <= 4:
                 name = first_line
@@ -314,7 +297,6 @@ def extract_lead_from_text(text: str) -> Optional[dict]:
     if dm:
         desc = dm.group(1).strip()
     else:
-        # ha nincs címkézve, akkor a teljes szöveg legyen leírás (limit)
         desc = text.strip()
         if len(desc) > 800:
             desc = desc[:800] + "..."
@@ -322,7 +304,7 @@ def extract_lead_from_text(text: str) -> Optional[dict]:
     return {
         "name": name or "Ismeretlen",
         "email": email,
-        "phone": phone or "",
+        "phone": phone,
         "description": desc,
     }
 
@@ -433,7 +415,6 @@ def chat(req: ChatReq, x_chatbot_secret: str = Header(default="")):
         raise HTTPException(401, "Unauthorized")
 
     user_msg = (req.message or "").strip()
-
     log_event({"type": "user", "session_id": req.session_id, "text": user_msg})
 
     # --- EASTER EGGS (csak pontos egyezés) ---
@@ -456,12 +437,9 @@ def chat(req: ChatReq, x_chatbot_secret: str = Header(default="")):
             reply = "Köszi! Megkaptuk az adataid, hamarosan felvesszük veled a kapcsolatot. ✅"
             log_event({"type": "assistant", "session_id": req.session_id, "text": reply, "lead": lead})
             return ChatResp(reply=format_to_html(reply))
-        # ha még nem adott meg elég adatot, menjen tovább a modellhez (de pending marad)
 
     # --- 1-2 szavas üzenet guard (ne legyen „esküvő” -> árlista) ---
-    # Itt inkább kérjünk pontosítást/LEAD-et, mint hogy rossz irányba menjen.
     if is_single_keyword(user_msg):
-        # rövid, fix szöveg (nem említ KB-t)
         reply = (
             "Kérlek pontosíts egy kicsit: melyik szolgáltatás érdekel pontosan (videó, drón, fotózás, vágás stb.) "
             "és milyen jellegű projektről van szó?"
@@ -481,18 +459,11 @@ def chat(req: ChatReq, x_chatbot_secret: str = Header(default="")):
 
     threads.messages.create(thread_id=thread_id, role="user", content=user_msg)
 
-    # file_search szigorítás: kevesebb találat, magasabb küszöb
+    # Fontos: egyes SDK verziók NEM támogatják a run.create-ben a file_search override-ot.
+    # Ezért biztonságosan nem küldjük el, így nem fog 500-zni.
     run = threads.runs.create(
         thread_id=thread_id,
         assistant_id=assistant_id,
-        # a "runs" doc szerint lehet file_search override
-        # (ha a te SDK-d ezt nem szereti, simán töröld ezt a blokkot)
-        tool_choice="auto",
-        tools=[{"type": "file_search"}],
-        # egyes SDK verziókban ez így megy át:
-        # file_search={"max_num_results": 8, "ranking_options": {"score_threshold": 0.55}}
-        # ha hibát adna: vedd ki ezt a sort
-        file_search={"max_num_results": 8, "ranking_options": {"score_threshold": 0.55}},
     )
 
     while True:
@@ -537,7 +508,7 @@ def chat(req: ChatReq, x_chatbot_secret: str = Header(default="")):
                 raw_parts.append(content.text.value)
         raw_text = "\n".join(raw_parts).strip()
 
-        # Ha a modell olyan mintát ír, ami LEAD-hez vezet, jelöljük pending-re (a következő user üzenetből szedjük)
+        # Ha a modell LEAD-et kér, jelöljük pending-re
         if "add meg az alábbi adatokat" in raw_text.lower() or "felvesszük veled a kapcsolatot" in raw_text.lower():
             _lead_pending[req.session_id] = True
 
@@ -596,50 +567,62 @@ def admin_upload(
 
     return {"status": "ok", "results": results}
 
-# ---------------- ADMIN: FILES LIST (robust) ----------------
+# ---------------- ADMIN: FILES LIST (robust + no 500 to WP) ----------------
 @app.get("/admin/files")
 def admin_files(x_admin_secret: str = Header(default="")):
     require_admin(x_admin_secret)
-    require_vs()
 
-    items = vs_api(client).files.list(vector_store_id=OPENAI_VECTOR_STORE_ID, limit=200)
+    if not OPENAI_VECTOR_STORE_ID:
+        return {"status": "ok", "files": [], "warning": "Nincs OPENAI_VECTOR_STORE_ID a Render ENV-ben."}
+
+    try:
+        items = vs_api(client).files.list(vector_store_id=OPENAI_VECTOR_STORE_ID, limit=200)
+    except Exception as e:
+        return {"status": "ok", "files": [], "warning": f"OpenAI list hiba: {str(e)}"}
 
     out = []
-    for it in items.data:
-        d_it = obj_to_dict(it)
-        vs_file_id = getattr(it, "id", None) or d_it.get("id") or ""
-        status = getattr(it, "status", "") or d_it.get("status", "")
-
-        file_id = None
-
-        # 1) próbáljuk details.retrieve-ből
+    for it in getattr(items, "data", []) or []:
         try:
-            details = vs_api(client).files.retrieve(vector_store_id=OPENAI_VECTOR_STORE_ID, file_id=vs_file_id)
-            dd = obj_to_dict(details)
-            file_id = (
-                dd.get("file_id")
-                or (dd.get("file") or {}).get("id")
-                or (dd.get("file") or {}).get("file_id")
-                or dd.get("openai_file_id")
-                or dd.get("source_file_id")
-            )
-            status = dd.get("status") or status
-        except Exception:
-            dd = {}
+            d_it = obj_to_dict(it)
+            vs_file_id = getattr(it, "id", None) or d_it.get("id") or ""
+            status = getattr(it, "status", "") or d_it.get("status", "")
 
-        # 2) ha nem jött, de vs_file_id file-... akkor gyakran maga az OpenAI file id
-        if not file_id and isinstance(vs_file_id, str) and vs_file_id.startswith("file-"):
-            file_id = vs_file_id
+            file_id = None
+            try:
+                details = vs_api(client).files.retrieve(vector_store_id=OPENAI_VECTOR_STORE_ID, file_id=vs_file_id)
+                dd = obj_to_dict(details)
+                file_id = (
+                    dd.get("file_id")
+                    or (dd.get("file") or {}).get("id")
+                    or (dd.get("file") or {}).get("file_id")
+                    or dd.get("openai_file_id")
+                    or dd.get("source_file_id")
+                )
+                status = dd.get("status") or status
+            except Exception:
+                dd = {}
 
-        meta = safe_get_file_meta(file_id) if file_id else {"filename": "", "created_at": None}
+            if not file_id and isinstance(vs_file_id, str) and vs_file_id.startswith("file-"):
+                file_id = vs_file_id
 
-        out.append({
-            "vector_store_file_id": vs_file_id,
-            "file_id": file_id,
-            "status": status,
-            "filename": meta.get("filename", "") or "",
-            "created_at": meta.get("created_at", None),
-        })
+            meta = safe_get_file_meta(file_id) if file_id else {"filename": "", "created_at": None}
+
+            out.append({
+                "vector_store_file_id": vs_file_id,
+                "file_id": file_id,
+                "status": status,
+                "filename": meta.get("filename", "") or "",
+                "created_at": meta.get("created_at", None),
+            })
+        except Exception as e:
+            out.append({
+                "vector_store_file_id": getattr(it, "id", None) or "",
+                "file_id": None,
+                "status": "error",
+                "filename": "",
+                "created_at": None,
+                "warning": f"Elem feldolgozási hiba: {str(e)}",
+            })
 
     return {"status": "ok", "files": out}
 
@@ -696,6 +679,74 @@ def admin_files_raw(x_admin_secret: str = Header(default="")):
     require_admin(x_admin_secret)
     require_vs()
     items = vs_api(client).files.list(vector_store_id=OPENAI_VECTOR_STORE_ID, limit=20)
-    raw = [obj_to_dict(it) for it in items.data]
+    raw = [obj_to_dict(it) for it in getattr(items, "data", []) or []]
     return {"status": "ok", "raw": raw}
-}
+
+# ---------------- ADMIN: LOGS (optional) ----------------
+def read_logs(limit: int = 200, session_id: Optional[str] = None) -> List[dict]:
+    if not LOG_ENABLED:
+        return []
+    if not os.path.exists(LOG_PATH):
+        return []
+    rows: List[dict] = []
+    with open(LOG_PATH, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+                if session_id and obj.get("session_id") != session_id:
+                    continue
+                rows.append(obj)
+            except Exception:
+                continue
+    return rows[-limit:]
+
+def summarize_sessions(limit: int = 50) -> List[dict]:
+    logs = read_logs(limit=5000, session_id=None)
+    last_by_session: Dict[str, dict] = {}
+    counts: Dict[str, int] = {}
+    for e in logs:
+        sid = e.get("session_id") or ""
+        if not sid:
+            continue
+        counts[sid] = counts.get(sid, 0) + 1
+        if sid not in last_by_session or int(e.get("ts", 0)) > int(last_by_session[sid].get("ts", 0)):
+            last_by_session[sid] = e
+    # sort by last ts desc
+    sessions = sorted(last_by_session.items(), key=lambda kv: int(kv[1].get("ts", 0)), reverse=True)
+    out = []
+    for sid, last in sessions[:limit]:
+        out.append({
+            "session_id": sid,
+            "last_ts": int(last.get("ts", 0)),
+            "count": counts.get(sid, 0),
+            "last_type": last.get("type", ""),
+            "last_text": (last.get("text", "") or "")[:160],
+        })
+    return out
+
+@app.get("/admin/logs")
+def admin_logs(
+    x_admin_secret: str = Header(default=""),
+    session_id: Optional[str] = Query(default=None),
+    limit: int = Query(default=200, ge=1, le=500),
+):
+    require_admin(x_admin_secret)
+    try:
+        data = read_logs(limit=limit, session_id=session_id)
+        return {"status": "ok", "logs_enabled": LOG_ENABLED, "log_path": LOG_PATH, "logs": data}
+    except Exception as e:
+        return {"status": "ok", "logs_enabled": LOG_ENABLED, "log_path": LOG_PATH, "logs": [], "warning": str(e)}
+
+@app.get("/admin/log_sessions")
+def admin_log_sessions(
+    x_admin_secret: str = Header(default=""),
+    limit: int = Query(default=50, ge=1, le=200),
+):
+    require_admin(x_admin_secret)
+    try:
+        return {"status": "ok", "sessions": summarize_sessions(limit=limit)}
+    except Exception as e:
+        return {"status": "ok", "sessions": [], "warning": str(e)}
