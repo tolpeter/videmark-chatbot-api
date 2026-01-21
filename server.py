@@ -698,3 +698,4 @@ def admin_files_raw(x_admin_secret: str = Header(default="")):
     items = vs_api(client).files.list(vector_store_id=OPENAI_VECTOR_STORE_ID, limit=20)
     raw = [obj_to_dict(it) for it in items.data]
     return {"status": "ok", "raw": raw}
+}
