@@ -4,6 +4,7 @@ import json
 import re
 import smtplib
 import base64
+import html
 from email.mime.text import MIMEText
 from typing import Optional, Dict, List, Any
 
@@ -193,15 +194,50 @@ def list_vector_store_files_paged(vs_id: str, limit: int, offset: int) -> dict:
     }
 
 
-# ---------------- HTML FORMATTER ----------------
-def format_to_html(text: str) -> str:
+# ---------------- SOURCE/CITATION STRIPPER ----------------
+_SOURCE_PATTERNS = [
+    r"\[\d+(?::\d+)?†source\]",   # [4†source] vagy [4:0†source]
+    r"【\d+†source】",             # 
+    r"\[\s*source\s*\]",          # [source]
+]
+
+def strip_sources(text: str) -> str:
+    """
+    Kiveszi a válaszok végéről/közepéről a 'source' jelöléseket, pl:
+    [4:0†source], [1†source],  stb.
+    """
     if not text:
         return ""
+    out = text
+    for pat in _SOURCE_PATTERNS:
+        out = re.sub(pat, "", out, flags=re.I)
+
+    # duplaszóközök, fura szóköz írásjelek előtt
+    out = re.sub(r"[ \t]{2,}", " ", out)
+    out = re.sub(r"\s+([.,!?:;])", r"\1", out)
+    return out.strip()
+
+
+# ---------------- HTML FORMATTER ----------------
+def format_to_html(text: str) -> str:
+    """
+    Egyszerű, biztonságosabb HTML formázó:
+    - listák: - vagy • kezdetű sorok -> <ul><li>
+    - üres sor -> <br>
+    - **félkövér** -> <strong>félkövér</strong>
+    """
+    if not text:
+        return ""
+
     text = re.sub(r"\r\n|\r", "\n", text)
 
     lines = text.split("\n")
     html_lines = []
     in_list = False
+
+    def apply_bold(escaped: str) -> str:
+        # **...** -> <strong>...</strong>
+        return re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", escaped)
 
     for line in lines:
         raw = line.strip()
@@ -211,7 +247,9 @@ def format_to_html(text: str) -> str:
                 html_lines.append("<ul>")
                 in_list = True
             item = re.sub(r"^[-•]\s+", "", raw)
-            html_lines.append(f"<li>{item}</li>")
+            item_esc = html.escape(item)
+            item_esc = apply_bold(item_esc)
+            html_lines.append(f"<li>{item_esc}</li>")
             continue
 
         if in_list:
@@ -221,7 +259,9 @@ def format_to_html(text: str) -> str:
         if raw == "":
             html_lines.append("<br>")
         else:
-            html_lines.append(raw)
+            safe = html.escape(raw)
+            safe = apply_bold(safe)
+            html_lines.append(safe)
 
     if in_list:
         html_lines.append("</ul>")
@@ -380,6 +420,7 @@ def get_or_create_assistant():
             "- Telefonszám\n"
             "- Rövid leírás\n\n"
             "Formázás: ha felsorolás van, használj kötőjeleket és sortörést. "
+            "Ne írj a válasz végére semmilyen forrásjelölést (pl. [1†source], [4:0†source], )."
         ),
         model=OPENAI_MODEL,
         tools=tools,
@@ -485,6 +526,9 @@ def chat(req: ChatReq, x_chatbot_secret: Optional[str] = Header(default=None)):
 
     if not reply_text:
         reply_text = "Nem kaptam választ. Próbáld újra."
+
+    # ✅ ITT TŰNIK EL A [4:0†source] stb.
+    reply_text = strip_sources(reply_text)
 
     log_event({"type": "assistant", "session_id": req.session_id, "text": reply_text})
     return ChatResp(reply=format_to_html(reply_text))
