@@ -3,12 +3,13 @@ import time
 import json
 import re
 import smtplib
-import base64
+import datetime
 from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from typing import Optional, Dict, List, Any
 
-import fitz  # PyMuPDF
 from fastapi import FastAPI, UploadFile, File, Header, HTTPException, Query
+from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from openai import OpenAI
@@ -29,9 +30,12 @@ SMTP_USER = os.getenv("SMTP_USER", "")
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
 NOTIFY_EMAIL = os.getenv("NOTIFY_EMAIL", "info@videmark.hu")
 
-# (opcionális) beszélgetés napló fájl (Renderen csak akkor marad meg, ha van persistent disk)
-LOG_ENABLED = os.getenv("LOG_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
-LOG_PATH = os.getenv("LOG_PATH", "./chat_logs.jsonl").strip()  # javaslat: /var/data/chat_logs.jsonl ha van disk
+# Naplózás helye (Renderen /var/data ajánlott perzisztens diskhez)
+LOG_PATH = os.getenv("LOG_PATH", "/var/data/chat_logs.jsonl")
+if not os.path.isabs(LOG_PATH): LOG_PATH = "./chat_logs.jsonl" # Fallback
+
+LEAD_BACKUP_PATH = os.getenv("LEAD_BACKUP_PATH", "/var/data/leads_backup.jsonl")
+if not os.path.isabs(LEAD_BACKUP_PATH): LEAD_BACKUP_PATH = "./leads_backup.jsonl" # Fallback
 
 ALLOWED_ORIGINS = [
     o.strip()
@@ -44,57 +48,25 @@ SYSTEM_PROMPT = """
 Te a Videmark weboldal profi értékesítő asszisztense vagy.
 
 TUDÁSBÁZIS: A válaszaidhoz elsődlegesen a feltöltött fájlok tartalmát használd (file_search).
-Ha a kérdésre van konkrét válasz a tudásbázisban (pl. szolgáltatás + ár), akkor AZONNAL azt add meg.
+Ha a kérdésre van konkrét válasz a tudásbázisban, akkor AZONNAL azt add meg.
 
-FONTOS VISELKEDÉSI SZABÁLYOK:
+SZABÁLYOK:
+1. PONTOSÍTÁS: Ha a felhasználó általánosan kérdez (pl. "Mennyibe kerül egy videó?"), kérdezz vissza a típusra. Ne listázd ki az összeset.
+2. NINCS TALÁLGATÁS: SOHA ne mondj olyan árat vagy szolgáltatást, ami nincs a fájlokban.
+3. LEAD GYŰJTÉS: Ha nincs válasz a fájlokban, kérj elérhetőséget (Név, Email, Telefon, Leírás) és mondd, hogy felvesszük vele a kapcsolatot.
+4. LEAD MENTÉS: Ha megadja az adatokat, hívd meg a `save_lead` funkciót!
+5. FORMÁZÁS: Használj Markdown-t (**félkövér**, listák).
 
-0. TUDÁSBÁZIS ELSŐDLEGESSÉGE:
-- A válaszaidat mindig a tudásbázis alapján add.
-- NE írj magyarázó mondatot arról, hogy “a feltöltött fájlok alapján” válaszolsz – csak válaszolj.
-
-1. PONTOSÍTÁS:
-- Ha a felhasználó általánosan kérdez (pl. „Mennyibe kerül egy videó?” / „Milyen árak vannak?”),
-  akkor NE sorold fel az összes árat automatikusan.
-- Kérdezz vissza röviden, hogy milyen típus érdekli (csak olyan példákat adj, amik a tudásbázisban szerepelnek).
-
-2. NINCS TALÁLGATÁS (Kritikus!):
-- SOHA ne említs olyan szolgáltatást / fotózási típust / videós típust vagy árat, ami NEM szerepel a tudásbázisban.
-- TILOS példaként felsorolni olyan opciókat (pl. esküvői fotózás), amelyek nem találhatók meg a tudásbázisban.
-- TILOS becsült, “kb.”, “általában ennyi”, “tól-ig” jellegű árat adni.
-
-3. HA HIÁNYZIK AZ INFORMÁCIÓ → LEAD (Kötelező):
-- Ha a kérdésre nincs konkrét válasz a tudásbázisban, NE találj ki árat vagy szolgáltatást.
-- Ilyenkor tereld LEAD irányba, pontosan így:
-  "A megadott szolgáltatás nem szerepel a rendelkezésre álló anyagokban.
-   A pontos árral kapcsolatban kérlek, add meg az alábbi adatokat,
-   és felvesszük veled a kapcsolatot:"
-  - Név
-  - Email cím
-  - Telefonszám
-  - Rövid leírás a projektről
-
-4. LEAD MENTÉS + ÉRTESÍTÉS:
-- Ha a felhasználó megadja az adatokat, KÖTELEZŐ meghívni a `save_lead` funkciót.
-
-5. FORMÁZÁS:
-- A fontos szavakat, árakat mindig emeld ki így: **ár**.
-- Felsorolásnál használj kötőjelet:
-  - Tétel 1
-  - Tétel 2
-- Használj címsorokat: ### Címsor
-
-Stílus: Magyar, közvetlen, segítőkész, rövid és lényegretörő.
-""".strip()
+Stílus: Magyar, közvetlen, segítőkész.
+"""
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# session -> thread
+# Memória cache
 _thread_map: Dict[str, str] = {}
-
-# ha leadet kértünk, jelöljük
 _lead_pending: Dict[str, bool] = {}
 
-app = FastAPI(title="Videmark Chatbot API v4.7 (limit<=10 fixed + paged listing + logs)")
+app = FastAPI(title="Videmark Chatbot API v5.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -104,199 +76,56 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ---------------- OPENAI COMPAT ----------------
-def vs_api(_client: OpenAI):
-    if hasattr(_client, "beta") and hasattr(_client.beta, "vector_stores"):
-        return _client.beta.vector_stores
-    if hasattr(_client, "vector_stores"):
-        return _client.vector_stores
-    raise HTTPException(
-        500,
-        "OpenAI python csomag túl régi: nincs vector_stores. Frissítsd: openai>=1.55.0 és Renderen 'Clear build cache & deploy'."
-    )
-
-def assistants_api(_client: OpenAI):
-    if hasattr(_client, "beta") and hasattr(_client.beta, "assistants"):
-        return _client.beta.assistants
-    raise HTTPException(500, "OpenAI beta assistants nem elérhető. Frissíts: openai>=1.55.0")
-
-def threads_api(_client: OpenAI):
-    if hasattr(_client, "beta") and hasattr(_client.beta, "threads"):
-        return _client.beta.threads
-    raise HTTPException(500, "OpenAI beta threads nem elérhető. Frissíts: openai>=1.55.0")
-
 # ---------------- HELPERS ----------------
-def obj_to_dict(x: Any) -> dict:
-    if x is None:
-        return {}
-    if isinstance(x, dict):
-        return x
-    if hasattr(x, "model_dump"):
-        try:
-            return x.model_dump()
-        except Exception:
-            pass
-    if hasattr(x, "dict"):
-        try:
-            return x.dict()
-        except Exception:
-            pass
-    try:
-        return json.loads(json.dumps(x, default=lambda o: getattr(o, "__dict__", str(o))))
-    except Exception:
-        return {"_raw": str(x)}
-
-def safe_get_file_meta(file_id: str) -> dict:
-    if not file_id:
-        return {"filename": "", "created_at": None}
-    try:
-        fmeta = client.files.retrieve(file_id)
-        return {
-            "filename": getattr(fmeta, "filename", "") or "",
-            "created_at": getattr(fmeta, "created_at", None),
-        }
-    except Exception:
-        return {"filename": "", "created_at": None}
-
-def require_admin(x_admin_secret: str):
-    if ADMIN_SECRET and x_admin_secret != ADMIN_SECRET:
+def require_admin(secret: str):
+    if ADMIN_SECRET and secret != ADMIN_SECRET:
         raise HTTPException(401, "Unauthorized (admin)")
 
-def require_vs():
-    if not OPENAI_VECTOR_STORE_ID:
-        raise HTTPException(400, "Nincs Vector Store ID (OPENAI_VECTOR_STORE_ID)")
-
-def is_single_keyword(msg: str) -> bool:
-    s = (msg or "").strip()
-    if not s:
-        return False
-    cleaned = re.sub(r"[^\w\sáéíóöőúüűÁÉÍÓÖŐÚÜŰ-]", " ", s).strip()
-    words = [w for w in cleaned.split() if w]
-    return 1 <= len(words) <= 2
-
 def log_event(event: dict):
-    if not LOG_ENABLED:
-        return
+    """Esemény naplózása fájlba."""
     try:
         event["ts"] = int(time.time())
+        event["dt"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         with open(LOG_PATH, "a", encoding="utf-8") as f:
             f.write(json.dumps(event, ensure_ascii=False) + "\n")
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"Log hiba: {e}")
 
-# --- FIX: OpenAI vector store list limit MAX 10 -> lapozunk ---
-VS_LIST_PAGE_LIMIT = 10  # az error alapján <=10
+def save_lead_backup(lead_data: dict):
+    """Biztonsági mentés, ha az email nem menne el."""
+    try:
+        lead_data["ts"] = datetime.datetime.now().isoformat()
+        with open(LEAD_BACKUP_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(lead_data, ensure_ascii=False) + "\n")
+    except Exception as e:
+        print(f"Lead backup hiba: {e}")
 
-def _vs_files_list_paged(max_items: int = 200) -> List[Any]:
-    """
-    Biztonságos listázás: a list() limitje max 10, ezért 'after' paraméterrel lapozunk.
-    """
-    require_vs()
-
-    collected: List[Any] = []
-    after: Optional[str] = None
-
-    # hard safety
-    if max_items < 1:
-        return []
-
-    while len(collected) < max_items:
-        remaining = max_items - len(collected)
-        page_limit = min(VS_LIST_PAGE_LIMIT, remaining)
-
-        kwargs = {"vector_store_id": OPENAI_VECTOR_STORE_ID, "limit": page_limit}
-        if after:
-            kwargs["after"] = after  # OpenAI list pagination
-
-        page = vs_api(client).files.list(**kwargs)
-
-        data = getattr(page, "data", None) or []
-        if not data:
-            break
-
-        collected.extend(data)
-        # next cursor: last item's id
-        last_id = getattr(data[-1], "id", None) or obj_to_dict(data[-1]).get("id")
-        after = last_id
-
-        # ha nincs több:
-        has_more = getattr(page, "has_more", None)
-        if has_more is False:
-            break
-
-        # extra guard: ha nincs last_id, nem tudunk tovább lapozni
-        if not after:
-            break
-
-    return collected
-
-# ---------------- HTML FORMATTER ----------------
-def format_to_html(text: str) -> str:
-    if not text:
-        return ""
-    text = re.sub(r"【.*?】", "", text)
-
-    lines = text.split("\n")
-    html_lines = []
-    in_list = False
-
-    for line in lines:
-        line = line.strip()
-        if not line:
-            if in_list:
-                html_lines.append("</ul>")
-                in_list = False
-            continue
-
-        if line.startswith("- ") or line.startswith("* "):
-            if not in_list:
-                html_lines.append('<ul style="margin: 5px 0 10px 20px; padding: 0;">')
-                in_list = True
-            content = re.sub(r"\*\*(.*?)\*\*", r"<b>\1</b>", line[2:])
-            html_lines.append(f'<li style="margin-bottom: 5px; list-style: disc;">{content}</li>')
-
-        elif line.startswith("###"):
-            if in_list:
-                html_lines.append("</ul>")
-                in_list = False
-            content = line.replace("###", "").strip()
-            html_lines.append(
-                f'<h3 style="margin: 15px 0 5px 0; font-size: 16px; border-bottom: 1px solid rgba(255,255,255,0.2);">{content}</h3>'
-            )
-        else:
-            if in_list:
-                html_lines.append("</ul>")
-                in_list = False
-            line = re.sub(r"\*\*(.*?)\*\*", r"<b>\1</b>", line)
-            html_lines.append(f'<p style="margin: 0 0 8px 0;">{line}</p>')
-
-    if in_list:
-        html_lines.append("</ul>")
-
-    return "\n".join(html_lines)
-
-# ---------------- EMAIL / LEAD ----------------
 def send_email_notification(lead_data: dict):
+    """Email küldése SMTP-vel."""
+    print(f"📧 Email küldés: {lead_data.get('email')}")
+    
     if not SMTP_USER or not SMTP_PASSWORD:
-        print("⚠️ Nincs SMTP beállítva.")
-        return
+        print("⚠️ Nincs SMTP beállítva! Csak backup mentés.")
+        save_lead_backup(lead_data)
+        return False
 
     subject = f"🔥 ÚJ LEAD: {lead_data.get('name', 'Ismeretlen')}"
-    body = f"""
-Új érdeklődő érkezett!
+    body_text = f"""
+Új érdeklődő érkezett a Chatbotból!
 
 Név: {lead_data.get('name')}
 Email: {lead_data.get('email')}
 Telefon: {lead_data.get('phone')}
 Leírás: {lead_data.get('description')}
 
-Dátum: {time.strftime('%Y-%m-%d %H:%M:%S')}
+Dátum: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 """
 
-    msg = MIMEText(body, "plain", "utf-8")
-    msg["Subject"] = subject
+    msg = MIMEMultipart()
     msg["From"] = SMTP_USER
     msg["To"] = NOTIFY_EMAIL
+    msg["Subject"] = subject
+    msg.attach(MIMEText(body_text, "plain", "utf-8"))
 
     try:
         server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT)
@@ -305,59 +134,31 @@ Dátum: {time.strftime('%Y-%m-%d %H:%M:%S')}
         server.send_message(msg)
         server.quit()
         print("✅ Email elküldve.")
+        return True
     except Exception as e:
         print(f"❌ Email hiba: {e}")
+        save_lead_backup(lead_data) # Ha hiba van, mentsük fájlba
+        return False
 
+# Regex fallback
 EMAIL_RE = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.I)
 PHONE_RE = re.compile(r"(\+?\d[\d\s().-]{7,}\d)")
 
 def extract_lead_from_text(text: str) -> Optional[dict]:
-    if not text:
-        return None
-
+    if not text: return None
     m = EMAIL_RE.search(text)
-    if not m:
-        return None
-    email = m.group(0).strip()
-
-    phone = ""
-    pm = PHONE_RE.search(text)
-    if pm:
-        phone = re.sub(r"\s+", " ", pm.group(0)).strip()
-
-    name = ""
-    nm = re.search(r"(?:^|\n)\s*(?:név|nev)\s*:\s*(.+)", text, re.I)
-    if nm:
-        name = nm.group(1).strip().split("\n")[0].strip()
-
-    if not name:
-        first_line = (text.strip().splitlines()[0] if text.strip() else "").strip()
-        if first_line and not EMAIL_RE.search(first_line) and not PHONE_RE.search(first_line):
-            parts = first_line.split()
-            if 1 <= len(parts) <= 4:
-                name = first_line
-
-    desc = ""
-    dm = re.search(r"(?:^|\n)\s*(?:leírás|leiras|projekt|rövid leírás|rovid leiras)\s*:\s*(.+)", text, re.I)
-    if dm:
-        desc = dm.group(1).strip()
-    else:
-        desc = text.strip()
-        if len(desc) > 800:
-            desc = desc[:800] + "..."
-
+    if not m: return None
     return {
-        "name": name or "Ismeretlen",
-        "email": email,
-        "phone": phone,
-        "description": desc,
+        "name": "Chat Felhasználó",
+        "email": m.group(0).strip(),
+        "phone": (PHONE_RE.search(text) or type('obj', (object,), {'group': lambda x: ""})).group(0).strip(),
+        "description": text
     }
 
 # ---------------- ASSISTANT ----------------
 def get_or_create_assistant():
     global OPENAI_ASSISTANT_ID
-    if OPENAI_ASSISTANT_ID:
-        return OPENAI_ASSISTANT_ID
+    if OPENAI_ASSISTANT_ID: return OPENAI_ASSISTANT_ID
 
     tools = [
         {"type": "file_search"},
@@ -365,7 +166,7 @@ def get_or_create_assistant():
             "type": "function",
             "function": {
                 "name": "save_lead",
-                "description": "Mentse el az érdeklődő adatait, és küldjön értesítést a Videmarknak.",
+                "description": "Mentse el az érdeklődő adatait.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -379,65 +180,20 @@ def get_or_create_assistant():
             },
         },
     ]
-
-    tool_resources = {}
+    
+    tool_res = {}
     if OPENAI_VECTOR_STORE_ID:
-        tool_resources = {"file_search": {"vector_store_ids": [OPENAI_VECTOR_STORE_ID]}}
+        tool_res = {"file_search": {"vector_store_ids": [OPENAI_VECTOR_STORE_ID]}}
 
-    asst = assistants_api(client).create(
-        name="Videmark Assistant V4.7",
+    asst = client.beta.assistants.create(
+        name="Videmark Assistant v5",
         instructions=SYSTEM_PROMPT,
         model=OPENAI_MODEL,
         tools=tools,
-        tool_resources=tool_resources,
+        tool_resources=tool_res,
     )
     OPENAI_ASSISTANT_ID = asst.id
     return OPENAI_ASSISTANT_ID
-
-# ---------------- OCR ----------------
-def ocr_image_with_openai(image_bytes: bytes, mime: str = "image/png") -> str:
-    data_url = f"data:{mime};base64," + base64.b64encode(image_bytes).decode("utf-8")
-    resp = client.chat.completions.create(
-        model=OPENAI_MODEL,
-        messages=[
-            {"role": "system", "content": "Feladat: OCR. Add vissza kizárólag a képen látható szöveget. Ne magyarázz. Ne adj hozzá semmit."},
-            {"role": "user", "content": [
-                {"type": "text", "text": "Írd ki pontosan a képen lévő szöveget (sorokkal együtt, ha van)."},
-                {"type": "image_url", "image_url": {"url": data_url}},
-            ]},
-        ],
-        temperature=0,
-    )
-    return (resp.choices[0].message.content or "").strip()
-
-def extract_text_from_pdf(pdf_bytes: bytes) -> str:
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    parts = []
-    for i in range(len(doc)):
-        t = doc[i].get_text("text") or ""
-        if t.strip():
-            parts.append(t)
-    return "\n".join(parts).strip()
-
-def ocr_pdf_with_openai(pdf_bytes: bytes) -> str:
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    out = []
-    for i in range(len(doc)):
-        pix = doc[i].get_pixmap(dpi=200)
-        img_bytes = pix.tobytes("png")
-        page_text = ocr_image_with_openai(img_bytes, mime="image/png")
-        if page_text.strip():
-            out.append(f"--- PAGE {i+1} ---\n{page_text}")
-    return "\n\n".join(out).strip()
-
-def upload_text_as_file_to_vector_store(text: str, filename: str) -> dict:
-    require_vs()
-    if not text.strip():
-        raise HTTPException(400, "Nem sikerült szöveget kinyerni (üres OCR).")
-    content = text.encode("utf-8", errors="ignore")
-    f = client.files.create(file=(filename, content), purpose="assistants")
-    vsf = vs_api(client).files.create(vector_store_id=OPENAI_VECTOR_STORE_ID, file_id=f.id)
-    return {"file_id": f.id, "vector_store_file_id": getattr(vsf, "id", None), "filename": filename}
 
 # ---------------- MODELS ----------------
 class ChatReq(BaseModel):
@@ -449,9 +205,10 @@ class ChatResp(BaseModel):
     reply: str
 
 # ---------------- ENDPOINTS ----------------
+
 @app.get("/")
 def root():
-    return {"status": "ok"}
+    return {"status": "ok", "time": datetime.datetime.now().isoformat()}
 
 @app.post("/chat", response_model=ChatResp)
 def chat(req: ChatReq, x_chatbot_secret: str = Header(default="")):
@@ -462,326 +219,193 @@ def chat(req: ChatReq, x_chatbot_secret: str = Header(default="")):
     user_msg = (req.message or "").strip()
     log_event({"type": "user", "session_id": req.session_id, "text": user_msg})
 
-    # --- EASTER EGGS (csak pontos egyezés) ---
+    # --- EASTER EGGS (Visszatettem!) ---
     if user_msg == "Csákó Edina":
-        reply = "SZeretlek Drágám!"
+        reply = "Szeretlek Drágám! ❤️"
         log_event({"type": "assistant", "session_id": req.session_id, "text": reply})
-        return ChatResp(reply=format_to_html(reply))
+        return ChatResp(reply=reply)
 
     if user_msg == "Dani vagyok":
-        reply = "Szia Webmester Mekmester"
+        reply = "Szia Webmester Mekmester! 🛠️"
         log_event({"type": "assistant", "session_id": req.session_id, "text": reply})
-        return ChatResp(reply=format_to_html(reply))
+        return ChatResp(reply=reply)
 
-    # --- LEAD fallback: ha előzőleg LEAD-et kértünk, próbáljuk kiszedni a user üzenetből ---
+    # Lead Fallback (ha a tool nem hívódott meg, de kértük)
     if _lead_pending.get(req.session_id):
         lead = extract_lead_from_text(user_msg)
         if lead:
             send_email_notification(lead)
             _lead_pending[req.session_id] = False
-            reply = "Köszi! Megkaptuk az adataid, hamarosan felvesszük veled a kapcsolatot. ✅"
+            reply = "Köszi! Megkaptuk az adataid, hamarosan keresünk. ✅"
             log_event({"type": "assistant", "session_id": req.session_id, "text": reply, "lead": lead})
-            return ChatResp(reply=format_to_html(reply))
-
-    # --- 1-2 szavas üzenet guard ---
-    if is_single_keyword(user_msg):
-        reply = (
-            "Kérlek pontosíts egy kicsit: melyik szolgáltatás érdekel pontosan (videó, drón, fotózás, vágás stb.) "
-            "és milyen jellegű projektről van szó?"
-        )
-        log_event({"type": "assistant", "session_id": req.session_id, "text": reply, "guard": "single_keyword"})
-        return ChatResp(reply=format_to_html(reply))
+            return ChatResp(reply=reply)
 
     assistant_id = get_or_create_assistant()
-    threads = threads_api(client)
-
+    
+    # Thread (szál) kezelése
     thread_id = _thread_map.get(req.session_id)
     if not thread_id:
-        thread = threads.create()
+        thread = client.beta.threads.create()
         thread_id = thread.id
         _thread_map[req.session_id] = thread_id
 
-    threads.messages.create(thread_id=thread_id, role="user", content=user_msg)
-    run = threads.runs.create(thread_id=thread_id, assistant_id=assistant_id)
+    # Idő kontextus hozzáadása
+    current_time_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M (%A)")
+    context_msg = f"[System Info: Jelenlegi idő: {current_time_str}]\n\n{user_msg}"
 
+    client.beta.threads.messages.create(thread_id=thread_id, role="user", content=context_msg)
+    run = client.beta.threads.runs.create(thread_id=thread_id, assistant_id=assistant_id)
+
+    # Várakozás a válaszra (Polling)
     while True:
-        run_status = threads.runs.retrieve(thread_id=thread_id, run_id=run.id)
-
+        run_status = client.beta.threads.runs.retrieve(thread_id=thread_id, run_id=run.id)
+        
         if run_status.status == "completed":
             break
-
+        
         if run_status.status == "requires_action":
             tool_outputs = []
             for tool_call in run_status.required_action.submit_tool_outputs.tool_calls:
                 if tool_call.function.name == "save_lead":
-                    try:
-                        args = json.loads(tool_call.function.arguments)
-                        send_email_notification(args)
-                        output_str = '{"success": true, "message": "Email elküldve."}'
-                        _lead_pending[req.session_id] = False
-                        log_event({"type": "lead", "session_id": req.session_id, "lead": args})
-                    except Exception:
-                        output_str = '{"success": false}'
+                    args = json.loads(tool_call.function.arguments)
+                    success = send_email_notification(args)
+                    log_event({"type": "lead", "session_id": req.session_id, "lead": args})
+                    output_str = '{"success": true}' if success else '{"success": false}'
                     tool_outputs.append({"tool_call_id": tool_call.id, "output": output_str})
-
+                    _lead_pending[req.session_id] = False
+            
             if tool_outputs:
-                threads.runs.submit_tool_outputs(thread_id=thread_id, run_id=run.id, tool_outputs=tool_outputs)
+                client.beta.threads.runs.submit_tool_outputs(thread_id=thread_id, run_id=run.id, tool_outputs=tool_outputs)
             continue
-
+            
         if run_status.status in ["failed", "cancelled", "expired"]:
-            reply = "Hiba történt. Próbáld újra."
-            log_event({"type": "assistant", "session_id": req.session_id, "text": reply, "error": run_status.status})
-            return ChatResp(reply=format_to_html(reply))
-
+            return ChatResp(reply="Hiba történt a feldolgozás során.")
+        
         time.sleep(0.5)
 
-    messages = threads.messages.list(thread_id=thread_id)
-    last_msg = messages.data[0]
-
+    # Utolsó válasz kinyerése
+    messages = client.beta.threads.messages.list(thread_id=thread_id)
     reply_text = ""
-    if last_msg.role == "assistant":
-        raw_parts = []
-        for content in last_msg.content:
+    if messages.data and messages.data[0].role == "assistant":
+        for content in messages.data[0].content:
             if content.type == "text":
-                raw_parts.append(content.text.value)
-        raw_text = "\n".join(raw_parts).strip()
+                reply_text += content.text.value
+    
+    # Ha adatot kér az AI, jegyezzük fel
+    if "add meg az alábbi adatokat" in reply_text.lower():
+        _lead_pending[req.session_id] = True
 
-        if "add meg az alábbi adatokat" in raw_text.lower() or "felvesszük veled a kapcsolatot" in raw_text.lower():
-            _lead_pending[req.session_id] = True
-
-        reply_text = format_to_html(raw_text)
-        log_event({"type": "assistant", "session_id": req.session_id, "text": raw_text})
-
+    log_event({"type": "assistant", "session_id": req.session_id, "text": reply_text})
     return ChatResp(reply=reply_text)
 
-# ---------------- ADMIN: UPLOAD ----------------
+# ---------------- ADMIN: LOG VIEWER ----------------
+@app.get("/admin/view_logs", response_class=HTMLResponse)
+def view_logs_html(secret: str = Query(..., alias="secret")):
+    require_admin(secret)
+    
+    if not os.path.exists(LOG_PATH):
+        return "<h1>Még nincs log fájl.</h1>"
+
+    logs = []
+    try:
+        with open(LOG_PATH, "r", encoding="utf-8") as f:
+            for line in f:
+                if line.strip(): logs.append(json.loads(line))
+    except Exception as e:
+        return f"Hiba: {e}"
+
+    sessions = {}
+    for entry in logs:
+        sid = entry.get("session_id", "unknown")
+        if sid not in sessions: sessions[sid] = []
+        sessions[sid].append(entry)
+
+    html = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Videmark Napló</title>
+        <style>
+            body{font-family:sans-serif;background:#f3f4f6;padding:20px;}
+            .card{background:#fff;padding:15px;margin-bottom:15px;border-radius:8px;box-shadow:0 1px 3px rgba(0,0,0,0.1);}
+            .head{font-weight:bold;color:#4F46E5;border-bottom:1px solid #eee;margin-bottom:10px;padding-bottom:5px;}
+            .msg{padding:8px;margin:5px 0;border-radius:6px;font-size:14px;}
+            .user{background:#e0e7ff;color:#1e1b4b;text-align:right;margin-left:20%;}
+            .assistant{background:#f1f5f9;color:#334155;margin-right:20%;}
+            .lead{background:#dcfce7;border:1px solid #22c55e;font-weight:bold;}
+            .ts{font-size:11px;color:#999;display:block;}
+        </style>
+    </head>
+    <body><h1>💬 Chat Napló</h1>
+    """
+    
+    sorted_sids = sorted(sessions.keys(), key=lambda k: sessions[k][-1].get("ts", 0), reverse=True)
+
+    for sid in sorted_sids:
+        msgs = sessions[sid]
+        last = msgs[-1].get("dt", "N/A")
+        html += f'<div class="card"><div class="head">Session: {sid} | Utolsó: {last}</div>'
+        for m in msgs:
+            role = m.get("type","")
+            txt = m.get("text","")
+            ts = m.get("dt","")
+            if role == "lead":
+                html += f'<div class="msg lead"><span class="ts">{ts}</span>LEAD: {json.dumps(m.get("lead"), ensure_ascii=False)}</div>'
+            else:
+                html += f'<div class="msg {role}"><span class="ts">{ts} ({role})</span>{txt}</div>'
+        html += '</div>'
+    
+    return html + "</body></html>"
+
+# ---------------- ADMIN: UPLOAD & FILES ----------------
 @app.post("/admin/upload")
-def admin_upload(
-    files: List[UploadFile] = File(default=[]),
-    files_arr: List[UploadFile] = File(default=[], alias="files[]"),
-    x_admin_secret: str = Header(default=""),
-    ocr: bool = Query(default=True),
-):
+def admin_upload(files: List[UploadFile] = File(default=[]), files_arr: List[UploadFile] = File(default=[], alias="files[]"), x_admin_secret: str = Header(default=""), ocr: bool = Query(default=True)):
     require_admin(x_admin_secret)
-    require_vs()
-
-    all_files: List[UploadFile] = []
-    all_files.extend(files or [])
-    all_files.extend(files_arr or [])
-    if not all_files:
-        raise HTTPException(422, "No files provided. Expected 'files' (or legacy 'files[]').")
-
+    all_files = files + files_arr
+    if not all_files: raise HTTPException(422, "Nincs fájl kiválasztva")
+    
     results = []
     for file in all_files:
-        raw = file.file.read()
-        filename = file.filename or "upload.bin"
-        content_type = (file.content_type or "").lower()
-
-        if ocr and content_type.startswith("image/"):
-            text = ocr_image_with_openai(raw, mime=content_type or "image/png")
-            txt_name = re.sub(r"\.[a-z0-9]+$", "", filename, flags=re.I) + "_OCR.txt"
-            results.append({"source": filename, "mode": "image_ocr", "uploaded": upload_text_as_file_to_vector_store(text, txt_name)})
-            continue
-
-        is_pdf = (content_type in ("application/pdf", "application/x-pdf")) or filename.lower().endswith(".pdf")
-        if ocr and is_pdf:
-            extracted = extract_text_from_pdf(raw)
-            if len(extracted.strip()) >= 80:
-                txt_name = re.sub(r"\.pdf$", "", filename, flags=re.I) + "_TEXT.txt"
-                results.append({"source": filename, "mode": "pdf_text_extract", "uploaded": upload_text_as_file_to_vector_store(extracted, txt_name)})
-            else:
-                ocred = ocr_pdf_with_openai(raw)
-                txt_name = re.sub(r"\.pdf$", "", filename, flags=re.I) + "_OCR.txt"
-                results.append({"source": filename, "mode": "pdf_ocr", "uploaded": upload_text_as_file_to_vector_store(ocred, txt_name)})
-            continue
-
-        f = client.files.create(file=(filename, raw), purpose="assistants")
-        vsf = vs_api(client).files.create(vector_store_id=OPENAI_VECTOR_STORE_ID, file_id=f.id)
-        results.append({"source": filename, "mode": "direct", "file_id": f.id, "vector_store_file_id": getattr(vsf, "id", None)})
-
-    return {"status": "ok", "results": results}
-
-# ---------------- ADMIN: FILES LIST (FIXED LIMIT<=10 + paged) ----------------
-@app.get("/admin/files")
-def admin_files(
-    x_admin_secret: str = Header(default=""),
-    limit: int = Query(default=50, ge=1, le=200),
-):
-    require_admin(x_admin_secret)
-
-    if not OPENAI_VECTOR_STORE_ID:
-        return {"status": "ok", "files": [], "warning": "Nincs OPENAI_VECTOR_STORE_ID a Render ENV-ben."}
-
-    # OpenAI oldali limit max 10, mi pedig lapozva gyűjtjük össze a kért mennyiséget
-    try:
-        items = _vs_files_list_paged(max_items=min(limit, 200))
-    except Exception as e:
-        return {"status": "ok", "files": [], "warning": f"OpenAI list hiba: {str(e)}"}
-
-    out = []
-    for it in items:
-        d_it = obj_to_dict(it)
-        vs_file_id = getattr(it, "id", None) or d_it.get("id") or ""
-        status = getattr(it, "status", "") or d_it.get("status", "")
-
-        file_id = None
         try:
-            details = vs_api(client).files.retrieve(vector_store_id=OPENAI_VECTOR_STORE_ID, file_id=vs_file_id)
-            dd = obj_to_dict(details)
-            file_id = (
-                dd.get("file_id")
-                or (dd.get("file") or {}).get("id")
-                or (dd.get("file") or {}).get("file_id")
-                or dd.get("openai_file_id")
-                or dd.get("source_file_id")
-            )
-            status = dd.get("status") or status
-        except Exception:
-            dd = {}
+            raw = file.file.read()
+            # Feltöltés OpenAI-nak (automatikusan kezeli a tartalmat)
+            f = client.files.create(file=(file.filename, raw), purpose="assistants")
+            client.beta.vector_stores.files.create(vector_store_id=OPENAI_VECTOR_STORE_ID, file_id=f.id)
+            results.append({"filename": file.filename, "status": "OK", "id": f.id})
+        except Exception as e:
+            results.append({"filename": file.filename, "status": "ERROR", "error": str(e)})
+            
+    return {"results": results}
 
-        if not file_id and isinstance(vs_file_id, str) and vs_file_id.startswith("file-"):
-            file_id = vs_file_id
-
-        meta = safe_get_file_meta(file_id) if file_id else {"filename": "", "created_at": None}
-
-        out.append({
-            "vector_store_file_id": vs_file_id,
-            "file_id": file_id,
-            "status": status,
-            "filename": meta.get("filename", "") or "",
-            "created_at": meta.get("created_at", None),
-        })
-
-    return {"status": "ok", "files": out}
-
-# ---------------- ADMIN: DELETE ----------------
-@app.delete("/admin/files/{vector_store_file_id}")
-def admin_delete_file(
-    vector_store_file_id: str,
-    x_admin_secret: str = Header(default=""),
-    delete_underlying_file: bool = Query(default=False),
-):
+@app.get("/admin/files")
+def admin_files(x_admin_secret: str = Header(default="")):
     require_admin(x_admin_secret)
-    require_vs()
+    if not OPENAI_VECTOR_STORE_ID: return {"files": []}
+    files = client.beta.vector_stores.files.list(vector_store_id=OPENAI_VECTOR_STORE_ID, limit=100)
+    
+    out = []
+    for f in files.data:
+        # Fájl részletek lekérése a nevéért
+        try:
+            meta = client.files.retrieve(f.id)
+            fname = meta.filename
+        except: fname = "Unknown"
+        out.append({"id": f.id, "filename": fname})
+        
+    return {"files": out}
 
-    underlying_file_id = None
+@app.delete("/admin/files/{file_id}")
+def admin_del(file_id: str, x_admin_secret: str = Header(default="")):
+    require_admin(x_admin_secret)
+    # Törlés Vector Store-ból és File Storage-ból is
     try:
-        vs_item = vs_api(client).files.retrieve(vector_store_id=OPENAI_VECTOR_STORE_ID, file_id=vector_store_file_id)
-        dd = obj_to_dict(vs_item)
-        underlying_file_id = (
-            dd.get("file_id")
-            or (dd.get("file") or {}).get("id")
-            or (dd.get("file") or {}).get("file_id")
-            or dd.get("openai_file_id")
-            or dd.get("source_file_id")
-        )
-    except Exception:
-        underlying_file_id = None
-
-    vs_api(client).files.delete(vector_store_id=OPENAI_VECTOR_STORE_ID, file_id=vector_store_file_id)
-
-    if delete_underlying_file:
-        if not underlying_file_id and vector_store_file_id.startswith("file-"):
-            underlying_file_id = vector_store_file_id
-        if underlying_file_id:
-            try:
-                client.files.delete(underlying_file_id)
-            except Exception:
-                pass
-
-    return {
-        "status": "ok",
-        "deleted_vector_store_file_id": vector_store_file_id,
-        "deleted_underlying_file_id": underlying_file_id,
-    }
+        client.beta.vector_stores.files.delete(vector_store_id=OPENAI_VECTOR_STORE_ID, file_id=file_id)
+        client.files.delete(file_id)
+    except: pass
+    return {"status": "deleted"}
 
 @app.post("/admin/create_vector_store")
-def create_vs(name: str = "Store", x_admin_secret: str = Header(default="")):
+def create_vs(name: str = "VidemarkStore", x_admin_secret: str = Header(default="")):
     require_admin(x_admin_secret)
-    vs = vs_api(client).create(name=name)
+    vs = client.beta.vector_stores.create(name=name)
     return {"id": vs.id}
-
-# Debug (ha kell)
-@app.get("/admin/files_raw")
-def admin_files_raw(
-    x_admin_secret: str = Header(default=""),
-    limit: int = Query(default=20, ge=1, le=200),
-):
-    require_admin(x_admin_secret)
-    if not OPENAI_VECTOR_STORE_ID:
-        return {"status": "ok", "raw": [], "warning": "Nincs OPENAI_VECTOR_STORE_ID."}
-
-    try:
-        items = _vs_files_list_paged(max_items=min(limit, 200))
-        raw = [obj_to_dict(it) for it in items]
-        return {"status": "ok", "raw": raw}
-    except Exception as e:
-        return {"status": "ok", "raw": [], "warning": str(e)}
-
-# ---------------- ADMIN: LOGS (optional) ----------------
-def read_logs(limit: int = 200, session_id: Optional[str] = None) -> List[dict]:
-    if not LOG_ENABLED:
-        return []
-    if not os.path.exists(LOG_PATH):
-        return []
-    rows: List[dict] = []
-    with open(LOG_PATH, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                obj = json.loads(line)
-                if session_id and obj.get("session_id") != session_id:
-                    continue
-                rows.append(obj)
-            except Exception:
-                continue
-    return rows[-limit:]
-
-def summarize_sessions(limit: int = 50) -> List[dict]:
-    logs = read_logs(limit=5000, session_id=None)
-    last_by_session: Dict[str, dict] = {}
-    counts: Dict[str, int] = {}
-    for e in logs:
-        sid = e.get("session_id") or ""
-        if not sid:
-            continue
-        counts[sid] = counts.get(sid, 0) + 1
-        if sid not in last_by_session or int(e.get("ts", 0)) > int(last_by_session[sid].get("ts", 0)):
-            last_by_session[sid] = e
-    sessions = sorted(last_by_session.items(), key=lambda kv: int(kv[1].get("ts", 0)), reverse=True)
-    out = []
-    for sid, last in sessions[:limit]:
-        out.append({
-            "session_id": sid,
-            "last_ts": int(last.get("ts", 0)),
-            "count": counts.get(sid, 0),
-            "last_type": last.get("type", ""),
-            "last_text": (last.get("text", "") or "")[:160],
-        })
-    return out
-
-@app.get("/admin/logs")
-def admin_logs(
-    x_admin_secret: str = Header(default=""),
-    session_id: Optional[str] = Query(default=None),
-    limit: int = Query(default=200, ge=1, le=500),
-):
-    require_admin(x_admin_secret)
-    try:
-        data = read_logs(limit=limit, session_id=session_id)
-        return {"status": "ok", "logs_enabled": LOG_ENABLED, "log_path": LOG_PATH, "logs": data}
-    except Exception as e:
-        return {"status": "ok", "logs_enabled": LOG_ENABLED, "log_path": LOG_PATH, "logs": [], "warning": str(e)}
-
-@app.get("/admin/log_sessions")
-def admin_log_sessions(
-    x_admin_secret: str = Header(default=""),
-    limit: int = Query(default=50, ge=1, le=200),
-):
-    require_admin(x_admin_secret)
-    try:
-        return {"status": "ok", "sessions": summarize_sessions(limit=limit)}
-    except Exception as e:
-        return {"status": "ok", "sessions": [], "warning": str(e)}
